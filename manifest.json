@@ -1,0 +1,16 @@
+{
+  "name": "AR幻景 Pro",
+  "short_name": "AR幻景Pro",
+  "description": "1:1 真实比例园林设计",
+  "start_url": "index.html",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#2ecc71",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/210/210543.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
