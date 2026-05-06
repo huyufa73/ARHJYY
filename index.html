@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>AR幻景 Pro - 完美版 (终极防卡死+无抖动)</title>
+    <title>AR幻景 Pro - 完美版 (终极防卡死+无抖动+云库扩展)</title>
     
     <script type="importmap">
         {
@@ -300,7 +300,6 @@ let isPreviewMode = false;
 let frameCount = 0;
 let lastTouchTime = 0;
 
-// ★★★ 全局蝴蝶下降锁：保证同一时刻最多只有 1 只蝴蝶下降到花上 ★★★
 let descendingButterflyIdx = -1;
 
 const PROCEDURAL_CACHE = {};
@@ -309,35 +308,71 @@ function getCached(key, factory) {
     return PROCEDURAL_CACHE[key];
 }
 
+// ★★★ 云端模型分类 ★★★
 const CLOUD_CATEGORIES = [
     { id: 'cat_zhiwu', name: '植物鲜花' },
+    { id: 'cat_shumu', name: '树木仙木' },
     { id: 'cat_jiashan', name: '假山石头' },
     { id: 'cat_jianzhu', name: '建筑景观' },
     { id: 'cat_renwu', name: '人物角色' }
 ];
 
+// ★★★ 严格按 MXSM.txt 仓库清单整理（共 42 个模型） ★★★
+// 植物花卉 21 个（矮株/花朵 - 蝴蝶会光顾） + 树木 9 个 = 30 个，全部在 ZhiWu_HuaHui/ 目录
+// 假山石头 8 个：JiaShan_1~2 + JiaShanShi_1~6
+// 建筑 2 个；人物 2 个
 const CLOUD_MODELS = [
-    { id: 'cloud_BaiMuDan', cat: 'cat_zhiwu', name: '白牡丹', icon: '🌺', file: 'ZhiWu_HuaHui/BaiMuDan.glb', isCloud: true, isPlant: true, realHeight: 0.7 },
-    { id: 'cloud_FenSeMuDan', cat: 'cat_zhiwu', name: '粉色牡丹', icon: '🌺', file: 'ZhiWu_HuaHui/FenSeMuDan.glb', isCloud: true, isPlant: true, realHeight: 0.7 },
-    { id: 'cloud_GeSangHua', cat: 'cat_zhiwu', name: '格桑花', icon: '🌸', file: 'ZhiWu_HuaHui/GeSangHua.glb', isCloud: true, isPlant: true, realHeight: 0.5 },
-    { id: 'cloud_HeHua_1', cat: 'cat_zhiwu', name: '荷花1', icon: '🪷', file: 'ZhiWu_HuaHui/HeHua_1.glb', isCloud: true, isPlant: true, realHeight: 0.6 },
-    { id: 'cloud_HeHua_2', cat: 'cat_zhiwu', name: '荷花2', icon: '🪷', file: 'ZhiWu_HuaHui/HeHua_2.glb', isCloud: true, isPlant: true, realHeight: 0.6 },
-    { id: 'cloud_HeHua_3', cat: 'cat_zhiwu', name: '荷花3', icon: '🪷', file: 'ZhiWu_HuaHui/HeHua_3.glb', isCloud: true, isPlant: true, realHeight: 0.6 },
-    { id: 'cloud_YinLianHua', cat: 'cat_zhiwu', name: '银莲花', icon: '💮', file: 'ZhiWu_HuaHui/YinLianHua.glb', isCloud: true, isPlant: true, realHeight: 0.4 },
-    { id: 'cloud_Zhu', cat: 'cat_zhiwu', name: '竹', icon: '🎋', file: 'ZhiWu_HuaHui/Zhu.glb', isCloud: true, isPlant: true, realHeight: 4.0 },
-    
-    { id: 'cloud_JiaShan_1', cat: 'cat_jiashan', name: '假山1', icon: '⛰️', file: 'JiaShan_ShiTou/JiaShan_1.glb', isCloud: true, canMultiRot: true, realHeight: 1.5 },
-    { id: 'cloud_JiaShan_2', cat: 'cat_jiashan', name: '假山2', icon: '⛰️', file: 'JiaShan_ShiTou/JiaShan_2.glb', isCloud: true, canMultiRot: true, realHeight: 1.5 },
-    { id: 'cloud_JiaShanShi_1', cat: 'cat_jiashan', name: '假山石1', icon: '🪨', file: 'JiaShan_ShiTou/JiaShanShi_1.glb', isCloud: true, canMultiRot: true, realHeight: 0.8 },
-    { id: 'cloud_JiaShanShi_2', cat: 'cat_jiashan', name: '假山石2', icon: '🪨', file: 'JiaShan_ShiTou/JiaShanShi_2.glb', isCloud: true, canMultiRot: true, realHeight: 0.8 },
-    { id: 'cloud_JiaShanShi_3', cat: 'cat_jiashan', name: '假山石3', icon: '🪨', file: 'JiaShan_ShiTou/JiaShanShi_3.glb', isCloud: true, canMultiRot: true, realHeight: 0.8 },
-    { id: 'cloud_JiaShanShi_4', cat: 'cat_jiashan', name: '假山石4', icon: '🪨', file: 'JiaShan_ShiTou/JiaShanShi_4.glb', isCloud: true, canMultiRot: true, realHeight: 0.8 },
-    { id: 'cloud_JiaShanShi_5', cat: 'cat_jiashan', name: '假山石5', icon: '🪨', file: 'JiaShan_ShiTou/JiaShanShi_5.glb', isCloud: true, canMultiRot: true, realHeight: 0.8 },
+    // ===== 植物花卉（21 个矮株/花朵 - 蝴蝶会光顾） =====
+    { id: 'cloud_BaiMuDan',         cat: 'cat_zhiwu', name: '白牡丹',     icon: '🌺', file: 'ZhiWu_HuaHui/BaiMuDan.glb',         isCloud: true, isPlant: true, realHeight: 0.7 },
+    { id: 'cloud_FenSeMuDan',       cat: 'cat_zhiwu', name: '粉色牡丹',   icon: '🌺', file: 'ZhiWu_HuaHui/FenSeMuDan.glb',       isCloud: true, isPlant: true, realHeight: 0.7 },
+    { id: 'cloud_FengXinXianHua',   cat: 'cat_zhiwu', name: '风信仙花',   icon: '🌸', file: 'ZhiWu_HuaHui/FengXinXianHua.glb',   isCloud: true, isPlant: true, realHeight: 0.55 },
+    { id: 'cloud_GeSangHua',        cat: 'cat_zhiwu', name: '格桑花',     icon: '🌸', file: 'ZhiWu_HuaHui/GeSangHua.glb',        isCloud: true, isPlant: true, realHeight: 0.5 },
+    { id: 'cloud_HeHua_1',          cat: 'cat_zhiwu', name: '荷花1',      icon: '🪷', file: 'ZhiWu_HuaHui/HeHua_1.glb',          isCloud: true, isPlant: true, realHeight: 0.6 },
+    { id: 'cloud_HeHua_2',          cat: 'cat_zhiwu', name: '荷花2',      icon: '🪷', file: 'ZhiWu_HuaHui/HeHua_2.glb',          isCloud: true, isPlant: true, realHeight: 0.6 },
+    { id: 'cloud_HeHua_3',          cat: 'cat_zhiwu', name: '荷花3',      icon: '🪷', file: 'ZhiWu_HuaHui/HeHua_3.glb',          isCloud: true, isPlant: true, realHeight: 0.6 },
+    { id: 'cloud_JinLvXianHua',     cat: 'cat_zhiwu', name: '金缕仙花',   icon: '🌼', file: 'ZhiWu_HuaHui/JinLvXianHua.glb',     isCloud: true, isPlant: true, realHeight: 0.6 },
+    { id: 'cloud_LiuLiHua',         cat: 'cat_zhiwu', name: '琉璃花',     icon: '🔮', file: 'ZhiWu_HuaHui/LiuLiHua.glb',         isCloud: true, isPlant: true, realHeight: 0.45 },
+    { id: 'cloud_LiuYingXianHua',   cat: 'cat_zhiwu', name: '流萤仙花',   icon: '✨', file: 'ZhiWu_HuaHui/LiuYingXianHua.glb',   isCloud: true, isPlant: true, realHeight: 0.55 },
+    { id: 'cloud_ManTuoLuoHua',     cat: 'cat_zhiwu', name: '曼陀罗华',   icon: '🌺', file: 'ZhiWu_HuaHui/ManTuoLuoHua.glb',     isCloud: true, isPlant: true, realHeight: 0.7 },
+    { id: 'cloud_ManZhuShaHua',     cat: 'cat_zhiwu', name: '曼珠沙华',   icon: '🔴', file: 'ZhiWu_HuaHui/ManZhuShaHua.glb',     isCloud: true, isPlant: true, realHeight: 0.65 },
+    { id: 'cloud_SanShengBiAnHua',  cat: 'cat_zhiwu', name: '三生彼岸花', icon: '🌹', file: 'ZhiWu_HuaHui/SanShengBiAnHua.glb',  isCloud: true, isPlant: true, realHeight: 0.7 },
+    { id: 'cloud_TianYuHua',        cat: 'cat_zhiwu', name: '天羽花',     icon: '🪶', file: 'ZhiWu_HuaHui/TianYuHua.glb',        isCloud: true, isPlant: true, realHeight: 0.55 },
+    { id: 'cloud_XingYingCao',      cat: 'cat_zhiwu', name: '星荧草',     icon: '🌿', file: 'ZhiWu_HuaHui/XingYingCao.glb',      isCloud: true, isPlant: true, realHeight: 0.4 },
+    { id: 'cloud_YinLianHua',       cat: 'cat_zhiwu', name: '银莲花',     icon: '💮', file: 'ZhiWu_HuaHui/YinLianHua.glb',       isCloud: true, isPlant: true, realHeight: 0.4 },
+    { id: 'cloud_YinLianHua_Hong',  cat: 'cat_zhiwu', name: '银莲花·红', icon: '🌸', file: 'ZhiWu_HuaHui/YinLianHua_Hong.glb',  isCloud: true, isPlant: true, realHeight: 0.4 },
+    { id: 'cloud_YinLianHua_Lan',   cat: 'cat_zhiwu', name: '银莲花·蓝', icon: '💠', file: 'ZhiWu_HuaHui/YinLianHua_Lan.glb',   isCloud: true, isPlant: true, realHeight: 0.4 },
+    { id: 'cloud_YuDieHua',         cat: 'cat_zhiwu', name: '玉蝶花',     icon: '🦋', file: 'ZhiWu_HuaHui/YuDieHua.glb',         isCloud: true, isPlant: true, realHeight: 0.5 },
+    { id: 'cloud_YuLuCao',          cat: 'cat_zhiwu', name: '玉露草',     icon: '💧', file: 'ZhiWu_HuaHui/YuLuCao.glb',          isCloud: true, isPlant: true, realHeight: 0.4 },
+    { id: 'cloud_ZiXiaXianRui',     cat: 'cat_zhiwu', name: '紫霞仙蕊',   icon: '🌷', file: 'ZhiWu_HuaHui/ZiXiaXianRui.glb',     isCloud: true, isPlant: true, realHeight: 0.55 },
 
-    { id: 'cloud_GongQiao', cat: 'cat_jianzhu', name: '拱桥', icon: '🌉', file: 'JianZhu_JingGuan/GongQiao.glb', isCloud: true, realHeight: 3.5 },
-    { id: 'cloud_ZhongShiLiangTing', cat: 'cat_jianzhu', name: '中式凉亭', icon: '🏯', file: 'JianZhu_JingGuan/ZhongShiLiangTing.glb', isCloud: true, realHeight: 4.5 },
+    // ===== 树木仙木（9 个 - 微风摆动 + 多轴旋转） =====
+    { id: 'cloud_HuanYinShu',       cat: 'cat_shumu', name: '幻音树',     icon: '🌳', file: 'ZhiWu_HuaHui/HuanYinShu.glb',        isCloud: true, isPlant: true, canMultiRot: true, realHeight: 4.0 },
+    { id: 'cloud_LiuShu',           cat: 'cat_shumu', name: '柳树',       icon: '🌳', file: 'ZhiWu_HuaHui/LiuShu.glb',            isCloud: true, isPlant: true, canMultiRot: true, realHeight: 5.0 },
+    { id: 'cloud_XieShiZhu',        cat: 'cat_shumu', name: '写实竹',     icon: '🎋', file: 'ZhiWu_HuaHui/XieShiZhu.glb',         isCloud: true, isPlant: true, canMultiRot: true, realHeight: 4.5 },
+    { id: 'cloud_XingChenMu',       cat: 'cat_shumu', name: '星辰木',     icon: '✨', file: 'ZhiWu_HuaHui/XingChenMu.glb',        isCloud: true, isPlant: true, canMultiRot: true, realHeight: 4.0 },
+    { id: 'cloud_YunQiShu',         cat: 'cat_shumu', name: '云栖树',     icon: '☁️', file: 'ZhiWu_HuaHui/YunQiShu.glb',          isCloud: true, isPlant: true, canMultiRot: true, realHeight: 4.5 },
+    { id: 'cloud_ZaoXingHeiSong',   cat: 'cat_shumu', name: '造型黑松',   icon: '🌲', file: 'ZhiWu_HuaHui/ZaoXingHeiSong.glb',    isCloud: true, isPlant: true, canMultiRot: true, realHeight: 3.5 },
+    { id: 'cloud_ZaoXingHeiSong_1', cat: 'cat_shumu', name: '造型黑松1',  icon: '🌲', file: 'ZhiWu_HuaHui/ZaoXingHeiSong_1.glb',  isCloud: true, isPlant: true, canMultiRot: true, realHeight: 3.5 },
+    { id: 'cloud_Zhu',              cat: 'cat_shumu', name: '竹',         icon: '🎍', file: 'ZhiWu_HuaHui/Zhu.glb',               isCloud: true, isPlant: true, canMultiRot: true, realHeight: 4.0 },
+    { id: 'cloud_Zhu_4',            cat: 'cat_shumu', name: '竹4',        icon: '🎍', file: 'ZhiWu_HuaHui/Zhu_4.glb',             isCloud: true, isPlant: true, canMultiRot: true, realHeight: 4.0 },
 
-    { id: 'cloud_TangDaiNv_1', cat: 'cat_renwu', name: '古装女1', icon: '💃', file: 'RenWu_JiaoSe/TangDaiNv_1.glb', isCloud: true, realHeight: 1.65 }
+    // ===== 假山石头（8 个 - 多轴旋转） 严格按仓库：JiaShan_1~2 + JiaShanShi_1~6 =====
+    { id: 'cloud_JiaShan_1',        cat: 'cat_jiashan', name: '假山1',    icon: '⛰️', file: 'JiaShan_ShiTou/JiaShan_1.glb',        isCloud: true, canMultiRot: true, realHeight: 1.8 },
+    { id: 'cloud_JiaShan_2',        cat: 'cat_jiashan', name: '假山2',    icon: '⛰️', file: 'JiaShan_ShiTou/JiaShan_2.glb',        isCloud: true, canMultiRot: true, realHeight: 1.8 },
+    { id: 'cloud_JiaShanShi_1',     cat: 'cat_jiashan', name: '假山石1',  icon: '🪨', file: 'JiaShan_ShiTou/JiaShanShi_1.glb',     isCloud: true, canMultiRot: true, realHeight: 0.8 },
+    { id: 'cloud_JiaShanShi_2',     cat: 'cat_jiashan', name: '假山石2',  icon: '🪨', file: 'JiaShan_ShiTou/JiaShanShi_2.glb',     isCloud: true, canMultiRot: true, realHeight: 0.8 },
+    { id: 'cloud_JiaShanShi_3',     cat: 'cat_jiashan', name: '假山石3',  icon: '🪨', file: 'JiaShan_ShiTou/JiaShanShi_3.glb',     isCloud: true, canMultiRot: true, realHeight: 0.8 },
+    { id: 'cloud_JiaShanShi_4',     cat: 'cat_jiashan', name: '假山石4',  icon: '🪨', file: 'JiaShan_ShiTou/JiaShanShi_4.glb',     isCloud: true, canMultiRot: true, realHeight: 0.8 },
+    { id: 'cloud_JiaShanShi_5',     cat: 'cat_jiashan', name: '假山石5',  icon: '🪨', file: 'JiaShan_ShiTou/JiaShanShi_5.glb',     isCloud: true, canMultiRot: true, realHeight: 0.8 },
+    { id: 'cloud_JiaShanShi_6',     cat: 'cat_jiashan', name: '假山石6',  icon: '🪨', file: 'JiaShan_ShiTou/JiaShanShi_6.glb',     isCloud: true, canMultiRot: true, realHeight: 0.8 },
+
+    // ===== 建筑景观（2 个） =====
+    { id: 'cloud_GongQiao',         cat: 'cat_jianzhu', name: '拱桥',     icon: '🌉', file: 'JianZhu_JingGuan/GongQiao.glb',          isCloud: true, realHeight: 3.5 },
+    { id: 'cloud_ZhongShiLiangTing',cat: 'cat_jianzhu', name: '中式凉亭', icon: '🏯', file: 'JianZhu_JingGuan/ZhongShiLiangTing.glb',isCloud: true, realHeight: 4.5 },
+
+    // ===== 人物角色（2 个） =====
+    { id: 'cloud_GuZhengNv',        cat: 'cat_renwu', name: '古筝女',     icon: '🎼', file: 'RenWu_JiaoSe/GuZhengNv.glb',     isCloud: true, realHeight: 1.65 },
+    { id: 'cloud_TangDaiNv_1',      cat: 'cat_renwu', name: '唐代女',     icon: '💃', file: 'RenWu_JiaoSe/TangDaiNv_1.glb',   isCloud: true, realHeight: 1.65 }
 ];
 
 let currentCloudCategory = 'cat_zhiwu';
@@ -397,7 +432,6 @@ function disableChildRaycast(group) {
     });
 }
 
-// ★★★ 几何体按材质合并（大幅减少 Draw Call）★★★
 function mergeBufferGeos(geometries) {
     if (geometries.length === 0) return null;
     if (geometries.length === 1) return geometries[0];
@@ -546,7 +580,6 @@ function optimizeGroupRaycast(group, asset) {
     hitMesh.userData.isHitbox = true;
     group.add(hitMesh);
 
-    // ★ 材质 PBR→Lambert 转换 + 去重（巨幅性能提升）★
     const matConvertCache = new WeakMap();
     const convertMat = (m) => {
         if (!m) return m;
@@ -598,12 +631,28 @@ function optimizeGroupRaycast(group, asset) {
         }
     });
     
-    // ★ 几何体按材质合并：把几十上百个 Mesh 压成 几个 Mesh ★
     mergeGroupByMaterial(group);
     
     group.userData.bbSize = [size.x, size.y, size.z];
     group.userData.bbCenter = [center.x, center.y, center.z];
     group.userData.boundingBox = box;
+}
+
+// ★★★ 多 CDN 兜底加载（jsdelivr → fastly → github raw 自动切换） ★★★
+const CDN_BASES = [
+    'https://cdn.jsdelivr.net/gh/huyufa73/ARHJYY@main/MoXingKu/',
+    'https://fastly.jsdelivr.net/gh/huyufa73/ARHJYY@main/MoXingKu/',
+    'https://gcore.jsdelivr.net/gh/huyufa73/ARHJYY@main/MoXingKu/',
+    'https://raw.githubusercontent.com/huyufa73/ARHJYY/main/MoXingKu/'
+];
+
+function tryLoadFromCDN(asset, cdnIdx, onSuccess, onFailAll) {
+    if (cdnIdx >= CDN_BASES.length) { onFailAll(); return; }
+    const url = CDN_BASES[cdnIdx] + asset.file;
+    gltfLoader.load(url, onSuccess, undefined, (err) => {
+        console.warn(`[CDN ${cdnIdx}] 加载失败 ${asset.file}:`, err.message || err);
+        tryLoadFromCDN(asset, cdnIdx + 1, onSuccess, onFailAll);
+    });
 }
 
 function getCloudModel(cloudId, onSuccess) {
@@ -629,8 +678,7 @@ function getCloudModel(cloudId, onSuccess) {
     toast.innerText = `正在极速加载: ${asset.name}...`;
     toast.style.display = 'block';
     
-    const url = `https://fastly.jsdelivr.net/gh/huyufa73/ARHJYY@main/MoXingKu/${asset.file}`;
-    gltfLoader.load(url, (gltf) => {
+    tryLoadFromCDN(asset, 0, (gltf) => {
         const group = gltf.scene;
         optimizeGroupRaycast(group, asset);
         cloudModelCache[asset.id] = group;
@@ -653,10 +701,10 @@ function getCloudModel(cloudId, onSuccess) {
             cb(cloned);
         });
         delete loadingLocks[cloudId];
-    }, undefined, (e) => { 
-        console.error("加载失败", asset.file, e); 
-        toast.innerText = '加载失败，请重试';
-        setTimeout(() => { toast.style.display = 'none'; }, 2000);
+    }, () => {
+        console.error("所有 CDN 加载失败:", asset.file);
+        toast.innerText = `❌ ${asset.name} 加载失败`;
+        setTimeout(() => { toast.style.display = 'none'; }, 2500);
         delete loadingLocks[cloudId];
     });
 }
@@ -1324,9 +1372,6 @@ const StonePondShader = {
     `
 };
 
-// ★★★★★ 写实蝴蝶系统：参考蓝凤蝶图样，6 只各异，6cm 翼展，状态机行为 ★★★★★
-
-// 6 套独特真实蝴蝶配色（每只独一无二）
 const BUTTERFLY_SCHEMES = [
     { base:'#1565c0', mid:'#42a5f5', light:'#ffffff', accent:'#ffd54f', edge:'#0a1f4d', spot:'#fff8e1', body:'#2c1810' },
     { base:'#e65100', mid:'#ff9800', light:'#fff3e0', accent:'#1a1a1a', edge:'#1a1a1a', spot:'#ffffff', body:'#1a0e0e' },
@@ -1336,7 +1381,6 @@ const BUTTERFLY_SCHEMES = [
     { base:'#004d40', mid:'#26a69a', light:'#b2dfdb', accent:'#fff176', edge:'#00251a', spot:'#ffffff', body:'#0e1a14' }
 ];
 
-// ★ 高质量蝴蝶翅膀贴图 ★
 function createRealisticButterflyWingTexture(scheme) {
     const SIZE = 192;
     const canvas = document.createElement('canvas');
@@ -1473,11 +1517,16 @@ function getSharedButterflyGeos() {
     return _sharedButterflyGeos;
 }
 
+// ★★★ 花朵 ID 集合：囊括所有云端 21 朵花，便于蝴蝶定位 ★★★
 const FLOWER_ID_SET = new Set([
     'peony', 'lotus', 'lotus_cluster',
-    'cloud_BaiMuDan', 'cloud_FenSeMuDan', 'cloud_GeSangHua',
-    'cloud_HeHua_1', 'cloud_HeHua_2', 'cloud_HeHua_3', 'cloud_YinLianHua',
-    'grass_flowers', 'grass_wind_flower'
+    'grass_flowers', 'grass_wind_flower',
+    'cloud_BaiMuDan', 'cloud_FenSeMuDan', 'cloud_FengXinXianHua', 'cloud_GeSangHua',
+    'cloud_HeHua_1', 'cloud_HeHua_2', 'cloud_HeHua_3', 'cloud_JinLvXianHua',
+    'cloud_LiuLiHua', 'cloud_LiuYingXianHua', 'cloud_ManTuoLuoHua', 'cloud_ManZhuShaHua',
+    'cloud_SanShengBiAnHua', 'cloud_TianYuHua', 'cloud_XingYingCao',
+    'cloud_YinLianHua', 'cloud_YinLianHua_Hong', 'cloud_YinLianHua_Lan',
+    'cloud_YuDieHua', 'cloud_YuLuCao', 'cloud_ZiXiaXianRui'
 ]);
 function isFlowerObject(obj) {
     if (!obj || !obj.userData) return false;
@@ -1486,7 +1535,6 @@ function isFlowerObject(obj) {
     return false;
 }
 
-// ★★★ 缓存花朵最高点 Y，避免每帧重算 Box3 ★★★
 function getFlowerSpot(obj) {
     if (obj.userData._flowerTopY === undefined) {
         try {
@@ -1506,7 +1554,6 @@ function getFlowerSpot(obj) {
     return new THREE.Vector3(obj.position.x, topY, obj.position.z);
 }
 
-// ★★★ 写实蝴蝶类（永远在花最高点上方 60cm）★★★
 class Butterfly {
     constructor(idx) {
         this.idx = idx;
@@ -1581,14 +1628,6 @@ class Butterfly {
         scene.add(this.group);
     }
     
-    pickFlower(flowers) {
-        if (this.targetFlower && flowers.includes(this.targetFlower) && Math.random() < 0.65) {
-            return this.targetFlower;
-        }
-        this.targetFlower = flowers[Math.floor(Math.random() * flowers.length)];
-        return this.targetFlower;
-    }
-    
     update(t) {
         const flowers = placedObjects.filter(isFlowerObject);
         
@@ -1631,9 +1670,7 @@ class Butterfly {
         const flowerPos = getFlowerSpot(this.targetFlower);
         if (!flowerPos) return;
         
-        // ★★★ 状态机：永远在花最高点上方 ★★★
         if (this.state === 'hover') {
-            // 花最高点上方 60cm 缓缓盘旋（不挡花）
             const ho = new THREE.Vector3(
                 Math.sin(t*0.18 + this.idlePhase) * 0.18,
                 0.6 + Math.sin(t*0.22 + this.idlePhase) * 0.04,
@@ -1657,7 +1694,6 @@ class Butterfly {
             }
         } 
         else if (this.state === 'descending') {
-            // 即使下降也保持在花上方 25cm，不挡花
             this.target.copy(flowerPos).add(new THREE.Vector3(
                 Math.sin(t*0.3 + this.idlePhase)*0.06,
                 0.25,
@@ -1673,7 +1709,6 @@ class Butterfly {
             }
         } 
         else if (this.state === 'resting') {
-            // 在花上方 22cm 微微悬停
             this.target.copy(flowerPos).add(new THREE.Vector3(
                 Math.sin(t*0.6 + this.idlePhase)*0.03,
                 0.22,
@@ -1713,7 +1748,6 @@ class Butterfly {
         this.velocity.clampLength(0, speed);
         this.group.position.add(this.velocity);
         
-        // ★ 双重保险：永远高于花最高点 15cm，避免穿插花朵 ★
         const minY = Math.max(groundLevel + 0.04, flowerPos.y + 0.15);
         if (this.group.position.y < minY) {
             this.group.position.y = minY;
@@ -1873,10 +1907,13 @@ function loop(t, frame) {
             });
         });
 
+        // ★ 云端植物 + 云端树木 共用同一动画系统 ★
         cloudAnimObjects.forEach(obj => {
             if(obj.userData.isPlant) {
-                const windX = Math.sin(timeSec * 1.5 + obj.userData.phase) * 0.02;
-                const windZ = Math.cos(timeSec * 1.2 + obj.userData.phase) * 0.02;
+                // 树木幅度小一些，花草幅度稍大
+                const amp = obj.userData.isTree ? 0.012 : 0.022;
+                const windX = Math.sin(timeSec * 1.5 + obj.userData.phase) * amp;
+                const windZ = Math.cos(timeSec * 1.2 + obj.userData.phase) * amp;
                 obj.rotation.x = obj.userData.baseRotX + windX;
                 obj.rotation.z = obj.userData.baseRotZ + windZ;
             }
@@ -2226,26 +2263,6 @@ function createRealisticPeony() {
     
     lotusClusters.push(group); 
     return group;
-}
-
-function createRandomStoneModel(scaleBase = 0.3, mat = MATS.stone) {
-    const group = new THREE.Group();
-    const stoneGeo = new THREE.DodecahedronGeometry(scaleBase, 1);
-    const stone = new THREE.Mesh(stoneGeo, mat);
-    deformMesh(stone, scaleBase * 0.15);
-    stone.scale.set(1 + Math.random() * 0.5, 0.8 + Math.random() * 0.4, 1 + Math.random() * 0.5);
-    stone.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, Math.random() * Math.PI);
-    group.add(stone);
-    const box = new THREE.Box3().setFromObject(group);
-    group.children.forEach(c => c.position.y -= box.min.y);
-    return group;
-}
-
-function createFlatShoreStone() {
-    const group = new THREE.Group();
-    const mat = Math.random() > 0.5 ? MATS.granite : MATS.bluestone;
-    const stone = new THREE.Mesh(new THREE.BoxGeometry(1.5, 0.2, 0.6), mat);
-    deformMesh(stone, 0.05); stone.position.y = 0.1; group.add(stone); return group;
 }
 
 function createWindyGrassCluster(withFlowers = false) {
@@ -2737,11 +2754,13 @@ function createObject(type, pos) {
             
             const assetDef = CLOUD_MODELS.find(a => a.id === type);
             const isPlant = !!(assetDef && assetDef.isPlant);
+            const isTree = !!(assetDef && assetDef.cat === 'cat_shumu');
             
             const { rx, rz } = applyRandomVariation(model, type, isPlant);
             
             if (isPlant) {
                 model.userData.isPlant = true;
+                model.userData.isTree = isTree;
                 model.userData.phase = Math.random() * Math.PI * 2;
                 model.userData.baseRotX = rx;
                 model.userData.baseRotZ = rz;
@@ -2796,6 +2815,8 @@ function selectObject(obj) {
         let isMultiRot = false;
         const cDef = CLOUD_MODELS.find(m => m.id === obj.userData.id);
         if (cDef && cDef.canMultiRot) isMultiRot = true;
+        const aDef = ASSETS.object.find(m => m.id === obj.userData.id);
+        if (aDef && aDef.canMultiRot) isMultiRot = true;
         
         if (!isMultiRot) { currentRotationAxis = 'y'; rotBtn.innerText = `轴:Y`; }
 
@@ -2949,6 +2970,7 @@ function setupInteractions() {
         if (selectedObj) {
             let isMultiRot = false;
             const cDef = CLOUD_MODELS.find(m => m.id === selectedObj.userData.id); if (cDef && cDef.canMultiRot) isMultiRot = true;
+            const aDef = ASSETS.object.find(m => m.id === selectedObj.userData.id); if (aDef && aDef.canMultiRot) isMultiRot = true;
             
             if (isMultiRot) {
                 const axes = ['y', 'x', 'z']; currentRotationAxis = axes[(axes.indexOf(currentRotationAxis) + 1) % 3]; e.target.innerText = `轴:${currentRotationAxis.toUpperCase()}`; 
@@ -3081,6 +3103,7 @@ function setupInteractions() {
             const s = Math.max(0.1, selectedObj.scale.x * (dist / lastTouchDist)); selectedObj.scale.set(s, s, s);
             let axis = 'y';
             const cDef = CLOUD_MODELS.find(m => m.id === selectedObj.userData.id); if(cDef && cDef.canMultiRot) axis = currentRotationAxis;
+            const aDef = ASSETS.object.find(m => m.id === selectedObj.userData.id); if(aDef && aDef.canMultiRot) axis = currentRotationAxis;
             selectedObj.rotation[axis] += (rot - lastTouchRot); lastTouchDist = dist; lastTouchRot = rot;
         }
     };
@@ -3405,6 +3428,7 @@ function generatePathModels() {
         const pos = new THREE.Vector3().lerpVectors(seg.p1, seg.p2, t);
         
         if(currentAsset.isCloud) {
+            const isTree = currentAsset.cat === 'cat_shumu';
             getCloudModel(currentAsset.modelId, (model) => {
                 model.position.copy(pos); model.position.y = 0; 
                 const baseScale = 0.85 + Math.random() * 0.3;
@@ -3415,7 +3439,9 @@ function generatePathModels() {
                 if(currentAsset.isPlant) { 
                     const rx = (Math.random()-0.5)*0.04; const rz = (Math.random()-0.5)*0.04;
                     model.rotation.x = rx; model.rotation.z = rz;
-                    model.userData.isPlant = true; model.userData.phase = Math.random() * Math.PI * 2; 
+                    model.userData.isPlant = true; 
+                    model.userData.isTree = isTree;
+                    model.userData.phase = Math.random() * Math.PI * 2; 
                     model.userData.baseRotX = rx; model.userData.baseRotZ = rz; cloudAnimObjects.push(model); 
                 }
                 group.add(model);
@@ -3512,7 +3538,11 @@ function renderCloudModelList() {
                 currentAsset.isPathObj = true; currentAsset.modelId = asset.id;
                 document.getElementById('spacing-ctrl').style.display = 'flex';
                 document.getElementById('spacing-label').innerText = "间距(mm)";
-                document.getElementById('path-spacing').value = asset.isPlant ? 3000 : 1500;
+                if (asset.cat === 'cat_shumu') {
+                    document.getElementById('path-spacing').value = 3000;
+                } else {
+                    document.getElementById('path-spacing').value = asset.isPlant ? 800 : 1500;
+                }
             } else { document.getElementById('spacing-ctrl').style.display = 'none'; }
             renderCloudModelList(); 
         };
