@@ -2636,8 +2636,6 @@ function loop(t, frame) {
         fadingLines[i].material.opacity -= 0.02;
         if (fadingLines[i].material.opacity <= 0) { scene.remove(fadingLines[i]); fadingLines.splice(i, 1); }
     }
-/* ★ 幽灵模型自动巡检：每 30 帧（约 0.5 秒）跑一次，全自动，无需手动点任何按钮 */
-    if (frameCount % 30 === 0) { try { ghostGuardTick(); } catch (e) {} }
 renderer.render(scene, camera);
     if (VIS.wantCanvas) { try { visGrabCanvas(); } catch (e) {} }
 }
@@ -3730,30 +3728,9 @@ function applyRandomVariation(obj, type, isPlant) {
     return { rx, rz };
 }
 
-/* ★ 人物(cat_renwu)单例创建锁：1.5s内同一id只允许一次创建，彻底阻断双触/双击产生幽灵 */
-const _charCreateLock = {};
-
 function createObject(type, pos) {
     if (type.startsWith('cloud_')) {
-        /* ★ 人物重复防护：① 时间锁 ② 近距离已有实例检测 */
-        const _assetPre = CLOUD_MODELS.find(a => a.id === type);
-        if (_assetPre && _assetPre.cat === 'cat_renwu') {
-            if (_charCreateLock[type]) return;          // 锁定中，本次创建跳过
-            _charCreateLock[type] = true;
-            setTimeout(() => { delete _charCreateLock[type]; }, 1500);
-            // 0.55m内已有同款人物则跳过（防止异步回调慢抵达时仍入场）
-            for (let _ci = 0; _ci < placedObjects.length; _ci++) {
-                const _co = placedObjects[_ci];
-                if (_co && _co.userData && _co.userData.id === type &&
-                    Math.hypot(_co.position.x - pos.x, _co.position.z - pos.z) < 0.55) return;
-            }
-        }
-        const _reqGen = sceneGen;   /* ★ 世代快照：回调触发时若世代已变（清空/读档），则废弃不入场 */
         getCloudModel(type, (model) => {
-            if (_reqGen !== sceneGen) {
-                try { if (model && model.parent) model.parent.remove(model); } catch(e) {}
-                return;
-            }
             model.userData.isModel = true;
             model.userData.id = type;
             const assetDef = CLOUD_MODELS.find(a => a.id === type);
@@ -3964,92 +3941,6 @@ function sweepGhosts() {
     });
     return n;
 }
-/* ==========================================================================
-   ★★★ 2026.8.28【幽灵模型零容忍巡检】★★★
-   不再追查幽灵从哪来，而是每 0.5 秒把整个场景过一遍，符合任一条就自动删：
-   ① 在场景里、却没登记在 placedObjects 里，且已存在超过 1.2 秒（野对象）
-   ② 云模型的"缓存原型"意外进了场景
-   ③ 同一个模型 id，水平距离 < 12cm（完全重叠）→ 删后来的那个
-   ④ 同一个模型 id，水平距离 < 60cm，一个悬空一个贴地 → 删悬空那个
-      （★ 这一条正是"屏幕上方卡一个人"的精准打击）
-   ★ 用「离地高度」滑块或「⬆层」按钮主动抬高过的模型，会被打上豁免标记，永不误删
-   → 你什么都不用点，幽灵最多存活 1.5 秒就自动消失
-   ========================================================================== */
-const _ghostSeen = new WeakMap();          // 对象 → 第一次在场景里被看到的时间
-
-function _ghostKill(o, why) {
-    try { pruneSway(o); } catch (e) {}
-    try { if (o.parent) o.parent.remove(o); } catch (e) {}
-    placedObjects      = placedObjects.filter(x => x !== o);
-    windyGrassClusters = windyGrassClusters.filter(x => x !== o);
-    lotusClusters      = lotusClusters.filter(x => x !== o);
-    cloudAnimObjects   = cloudAnimObjects.filter(x => x !== o);
-    _ghostSeen.delete(o);
-    if (selectedObj === o) { selectedObj = null; try { selectObject(null); } catch (e) {} }
-    try { if (typeof chatTarget !== 'undefined' && chatTarget === o) closeChatPanel(); } catch (e) {}
-    console.warn('[幽灵巡检] ' + why, (o.userData && (o.userData.id || o.userData.modelId)) || '');
-}
-
-function ghostGuardTick() {
-    if (!scene) return;
-    const now = Date.now();
-
-    /* ---- ① ② 野对象 / 缓存原型 ---- */
-    const kids = scene.children.slice();
-    for (let i = 0; i < kids.length; i++) {
-        const o = kids[i];
-        if (isSystemSceneChild(o)) continue;
-        if (placedObjects.indexOf(o) >= 0) { _ghostSeen.delete(o); continue; }
-        if (isProtoObject(o)) { try { if (o.parent) o.parent.remove(o); } catch (e) {} continue; }
-        const t0 = _ghostSeen.get(o);
-        if (t0 === undefined) { _ghostSeen.set(o, now); continue; }   // 给 1.2 秒宽限期
-        if (now - t0 < 1200) continue;
-        _ghostKill(o, '已清除未登记的残留模型');
-    }
-
-    /* ---- ③ ④ 重复 / 悬空重影 ---- */
-    const groups = {};
-    for (let i = 0; i < placedObjects.length; i++) {
-        const o = placedObjects[i];
-        if (!o || !o.parent) continue;
-        const ud = o.userData || {};
-        if (ud.isScatter || ud.isPathObj || ud.isPaving) continue;   // 这些天生成群，不参与
-        const id = ud.id || ud.modelId;
-        if (!id) continue;
-        (groups[id] = groups[id] || []).push(o);
-    }
-    for (const id in groups) {
-        const arr = groups[id];
-        if (arr.length < 2) continue;
-        /* ★ 人物专属：同款人物出现重复时，删 placedObjects 中靠后的（即后来偷跑进场的幽灵） */
-        const _gIsChar = (function(){ const _gd = CLOUD_MODELS.find(m => m.id === id); return !!(_gd && _gd.cat === 'cat_renwu'); })();
-        for (let a = 0; a < arr.length; a++) {
-            for (let b = a + 1; b < arr.length; b++) {
-                const A = arr[a], B = arr[b];
-                if (!A || !B || !A.parent || !B.parent) continue;
-                const hd = Math.hypot(A.position.x - B.position.x, A.position.z - B.position.z);
-                const ya = A.position.y - groundLevel, yb = B.position.y - groundLevel;
-                let kill = null, why = '';
-                if (hd < 0.12) {
-                    kill = B; why = '已清除完全重叠的重复模型';
-                } else if (hd < 0.60 && Math.abs(ya - yb) > 0.30) {
-                    kill = (ya > yb) ? A : B;                       // 删悬空那个
-                    why  = '已清除悬空重影模型';
-                } else if (_gIsChar && hd < 0.80) {
-                    /* ★ 人物0.80m内重复 → 删placedObjects中更靠后的那个（后创建的幽灵） */
-                    const ia = placedObjects.indexOf(A), ib = placedObjects.indexOf(B);
-                    kill = (ia > ib) ? A : B;
-                    why = '已清除重复人物幽灵（' + id + '）';
-                }
-                /* 用户自己抬高的 → 豁免，绝不误删 */
-                if (kill && kill.userData && kill.userData._userLifted) kill = null;
-                if (!kill) continue;
-                _ghostKill(kill, why);
-                if (kill === A) break;                              // A 已删，跳出内层
-            }
-        }
-    }
-}
 /* ====== ★ 幽灵清理模块结束 ★ ====== */
 function doUndo() {
     if (currentMode === 'path' && pathPoints.length > 0) { pathPoints.pop(); updatePreviewLine();
@@ -4066,15 +3957,6 @@ function doUndo() {
 }
 
 function doClear() {
-    /* ★ 清空前先断开语音通话，防止 TALK.rig 持有已删模型的顶点着色器材质引用，导致界面卡死 */
-    try {
-        if (typeof VC !== 'undefined' && VC.on) {
-            ttsStop(); talkStop();
-            VC.on = false; TALK.rig = null; chatTarget = null;
-            const _vb = document.getElementById('vc-bar'); if (_vb) _vb.classList.remove('on');
-            const _vf = document.getElementById('vc-fab'); if (_vf) _vf.classList.remove('on');
-        }
-    } catch(e) {}
     bumpGen();          // ★ 先把所有"正在下载中的模型"作废，杜绝清完又冒出来
     placedObjects.forEach(o => { try { pruneSway(o); } catch (e) {} scene.remove(o); });
     placedObjects = []; windyGrassClusters = []; lotusClusters = [];
@@ -4494,12 +4376,7 @@ function setupInteractions() {
             if (selectedObj.userData.fillMesh && selectedObj.userData.fillMesh.material) applyRotation(selectedObj.userData.fillMesh.material);
         }
     };
-    document.getElementById('height-slider').oninput = (e) => {
-        if (!selectedObj) return;
-        selectedObj.position.y = groundLevel + parseFloat(e.target.value);
-        /* ★ 打上"用户主动抬高"豁免标记 → 幽灵巡检永不误删这个模型 */
-        if (parseFloat(e.target.value) > 0.05) selectedObj.userData._userLifted = true;
-    };
+    document.getElementById('height-slider').oninput = (e) => { if (selectedObj) selectedObj.position.y = groundLevel + parseFloat(e.target.value); };
     document.getElementById('btn-rot-axis').onclick = (e) => {
         if (selectedObj) {
             let isMultiRot = false;
@@ -4582,8 +4459,7 @@ function setupInteractions() {
         if (tpoolMode > 0) { placeTreePoolByNumber(); return; }
         if(currentMode === 'path') { isDrawing = true; btnDraw.classList.add('active'); } 
         else { if(lastHitPose) { const pt = new THREE.Vector3(lastHitPose.transform.position.x, groundLevel, lastHitPose.transform.position.z);
-    hitExistingObject = true; /* ★修复：阻止 touchend/mouseup 的 handleInteractEnd 再次调用 createObject */
-    createObject(currentAsset.id, pt); } }
+        createObject(currentAsset.id, pt); } }
     };
     window.onpointerup = () => { isDrawing = false; sharpAnchor = null; btnDraw.classList.remove('active'); };
     document.getElementById('btn-done').onclick = () => {
@@ -5364,7 +5240,6 @@ function shiftLayer(dir) {
     if (!selectedObj) { showSysToast('请先点选一个模型/面'); return; }
     const step = 0.02; // 每层 20mm
     selectedObj.userData.layer = (selectedObj.userData.layer || 0) + dir;
-    selectedObj.userData._userLifted = true;      // ★ 豁免标记：巡检永不误删手动调过层的模型
     selectedObj.position.y += step * dir;
     const ro = 10 + selectedObj.userData.layer * 10;
     selectedObj.traverse(c => { if (c.isMesh) c.renderOrder = ro; });
@@ -6499,12 +6374,12 @@ function setupArchiveAndMusic() {
    ========================================================================== */
 
 /* ┌────────── ① 硅基流动密钥（已填好你的 Key）──────────┐ */
-const SF_API_KEY = 'sk-gsdluvqusknqgancpkkvmzziwvweequmsgtlannylbvckjab';
+const SF_API_KEY = 'ark-96d49cd7-014b-4039-920c-28f37f6e6cad-356f0';
 /* └────────────────────────────────────────────────────┘ */
 
 /* 接口地址（OpenAI 完全兼容）。若手机报"跨域/CORS失败"，把你的代理前缀填进 SF_PROXY */
-const SF_BASE  = 'https://api.siliconflow.cn/v1';
-const SF_PROXY = '';
+const SF_BASE  = 'https://ark.cn-beijing.volces.com/api/v3';
+const SF_PROXY = ''; /* 火山引擎国内直连，一般不需要代理 */
 function sfURL(p) { return SF_PROXY ? (SF_PROXY + SF_BASE + p) : (SF_BASE + p); }
 function SF_CHAT_URL() { return sfURL('/chat/completions'); }
 function SF_TTS_URL()  { return sfURL('/audio/speech'); }
@@ -6516,31 +6391,21 @@ const AGNES_API_KEY = SF_API_KEY;   /* 兼容旧变量名，别删 */
 /* ★ 2026.8.27 重排：按"聪明程度 + 语音通话速度"排序，第一个是默认
    askAI 自带自动降级：某个模型不可用会自动往下试，绝不会打不通 */
 const AGNES_MODELS = [
-    { id: 'Qwen/Qwen3-30B-A3B',        name: '① Qwen3-30B-A3B　【推荐·又聪明又快】' },
-    { id: 'zai-org/GLM-4.5-Air',       name: '② GLM-4.5-Air　【会算数·情商高】' },
-    { id: 'Qwen/Qwen3-32B',            name: '③ Qwen3-32B　【学识最广】' },
-    { id: 'Qwen/Qwen2.5-72B-Instruct', name: '④ Qwen2.5-72B　【百科全书】' },
-    { id: 'deepseek-ai/DeepSeek-V3',   name: '⑤ DeepSeek-V3　【最强·略慢】' },
-    { id: 'Qwen/Qwen3-14B',            name: '⑥ Qwen3-14B　【便宜备用】' },
-    { id: 'Qwen/Qwen3-8B',             name: '⑦ Qwen3-8B　【免费兜底·最笨】' }
+    { id: 'doubao-1.5-pro-32k-250115',  name: '① 豆包1.5-Pro-32k【推荐·性价比最高】' },
+    { id: 'doubao-pro-32k-240615',      name: '② 豆包Pro-32k【经典稳定版】' },
+    { id: 'doubao-1.5-lite-32k-250115', name: '③ 豆包1.5-Lite-32k【超快超省钱】' },
+    { id: 'doubao-lite-32k-240615',     name: '④ 豆包Lite-32k【便宜备用】' },
+    { id: 'doubao-1.5-pro-128k-250115', name: '⑤ 豆包1.5-Pro-128k【超长上下文】' },
+    { id: 'doubao-lite-4k-240515',      name: '⑥ 豆包Lite-4k【最省钱兜底】' }
 ];
 const SF_MODELS = AGNES_MODELS;
 
 /* ★③ 云端情感语音（TTS）：比手机自带朗读像真人得多 */
-const SF_TTS_MODEL = 'FunAudioLLM/CosyVoice2-0.5B';
-const SF_VOICES = [
-    { id: 'bella',    name: '🌸 Bella 温柔女声（推荐·最像豆包）' },
-    { id: 'anna',     name: '💃 Anna 活力女声' },
-    { id: 'diana',    name: '😄 Diana 甜美女声' },
-    { id: 'claire',   name: '🍃 Claire 轻柔女声' },
-    { id: 'alex',     name: '🎧 Alex 沉稳男声' },
-    { id: 'charles',  name: '🎙 Charles 磁性男声' },
-    { id: 'benjamin', name: '🔊 Benjamin 低沉男声' },
-    { id: 'david',    name: '☀️ David 欢快男声' }
-];
+const SF_TTS_MODEL = 'doubao-tts-hd';
+
 
 /* ★④ 云端语音识别（ASR）：SenseVoiceSmall，免费、中文准、不卡、没有叮咚提示音 */
-const SF_ASR_MODEL = 'FunAudioLLM/SenseVoiceSmall';
+const SF_ASR_MODEL = 'doubao-asr';
 
 /* ★⑤ 情感 → CosyVoice2 语气指令（AI 会自己在开头标【情感】） */
 const SF_EMO = {
@@ -6748,16 +6613,19 @@ const SF_SILENT = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIh
 /* ★ 强制迁移到"最优方式"：云端识别 + 云端情感语音（旧手机存的 local 会被纠正回来） */
 if (VC.set.tts     === undefined) VC.set.tts = 'cloud';
 if (VC.set.asr     === undefined) VC.set.asr = 'cloud';
-if (VC.set.sfVoice === undefined) VC.set.sfVoice = 'bella';
+if (VC.set.sfVoice === undefined) VC.set.sfVoice = 'zh_female_wanwanxiaohe_moon_bigtts';
 if (VC.set.emo     === undefined) VC.set.emo = true;
-if (VC.set.mic     === undefined) VC.set.mic = 1.30;   // ★ 麦克风灵敏度（可在 ⚙ 里调）
-if (VC.set._v !== 3) {                       // 只纠正一次
-    VC.set._v = 3;
-    VC.set.tts = 'cloud';                    // 默认云端情感语音
-    VC.set.asr = 'cloud';                    // 默认云端识别（不选浏览器）
-    VC.set.rate = 1.00; VC.set.pitch = 1.02; // 更自然，不发嗲
+if (VC.set._v !== 5) {                       // 只纠正一次
+    VC.set._v = 5;
+    VC.set.tts = 'cloud';                    // 默认豆包云端语音
+    VC.set.asr = 'cloud';                    // 默认云端识别
+    VC.set.rate = 1.00; VC.set.pitch = 1.02; // 自然语速音调
+    VC.set.sfVoice = 'zh_female_wanwanxiaohe_moon_bigtts'; // 重置为豆包音色
 }
-if (String(VC.set.model || '').indexOf('agnes') === 0 ||
+if (String(VC.set.model || '').indexOf('Qwen') === 0 ||
+    String(VC.set.model || '').indexOf('deepseek') === 0 ||
+    String(VC.set.model || '').indexOf('zai-org') === 0 ||
+    String(VC.set.model || '').indexOf('agnes') === 0 ||
     AGNES_MODELS.findIndex(m => m.id === VC.set.model) < 0) VC.set.model = AGNES_MODELS[0].id;
 vcSave();
 
@@ -6830,12 +6698,10 @@ async function sfTTS(text, emo) {
             headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + SF_API_KEY },
             body: JSON.stringify({
                 model: SF_TTS_MODEL,
-                input: (ins ? (ins + '<|endofprompt|>') : '') + text,
-                voice: SF_TTS_MODEL + ':' + (VC.set.sfVoice || 'bella'),
+                input: text,
+                voice: VC.set.sfVoice || 'zh_female_wanwanxiaohe_moon_bigtts',
                 response_format: 'mp3',
-                sample_rate: 32000,
-                speed: Math.max(0.5, Math.min(2, VC.set.rate || 1)),
-                gain: 0
+                speed: Math.max(0.5, Math.min(2, VC.set.rate || 1))
             })
         });
         clearTimeout(to);
@@ -6982,7 +6848,7 @@ function ttsPush(text, isLast) {
     if (arr.length) {
         SPEAK_ALL += text;
         ttsQ = ttsQ.concat(arr);
-        if (!ttsSpeaking) { ttsSpeaking = true; talkStart(); vcStatus('◉ 说话中'); recGuardTo = Date.now() + 950; }
+        if (!ttsSpeaking) { ttsSpeaking = true; talkStart(); vcStatus('◉ 说话中'); recGuardTo = Date.now() + 380; }
         if (!ttsRunning) {
             if (cloud) { ttsRunning = true; _ttsPumpCloud(ttsToken); }
             else _ttsPumpLocal(ttsToken);
@@ -7047,23 +6913,20 @@ function vadLoop() {
     const now = Date.now();
     const talking = ttsSpeaking;
 
-    /* 自适应底噪：安静时慢慢学习环境噪声。★ 上限从 0.060 降到 0.030，
-       防止在嘈杂环境把门槛学得太高，导致"说话没反应" */
+    /* 自适应底噪：安静时慢慢学习环境噪声 */
     if (!VAD.speaking && !talking && rms < VAD.floor * 2.5) VAD.floor = VAD.floor * 0.97 + rms * 0.03;
     if (VAD.floor < 0.0025) VAD.floor = 0.0025;
-    if (VAD.floor > 0.0300) VAD.floor = 0.0300;
+    if (VAD.floor > 0.0600) VAD.floor = 0.0600;
 
-    /* ★ 灵敏度可在 ⚙ 里调（默认 1.3 = 比原来灵敏约 35%；戴耳机可拉到 2.0） */
-    const _sens = Math.max(0.5, Math.min(2.5, VC.set.mic || 1.3));
     /* 她在说话时抬高门槛，防止把自己的声音当成你 */
-    const thOn  = talking ? Math.max(0.050, VAD.floor * 4.4) : Math.max(0.0070, VAD.floor * 1.42) / _sens;
-    const thOff = talking ? Math.max(0.028, VAD.floor * 2.8) : Math.max(0.0048, VAD.floor * 1.10) / _sens;
+    const thOn  = talking ? Math.max(0.060, VAD.floor * 5.2) : Math.max(0.0095, VAD.floor * 1.75);
+    const thOff = talking ? Math.max(0.032, VAD.floor * 3.2) : Math.max(0.0060, VAD.floor * 1.25);
 
     if ((VAD.uiN = (VAD.uiN + 1) % 3) === 0) vcMeter(rms, thOn);
 
     if (rms > thOn) {
         VAD.hot++; VAD.lastVoice = now;
-        if (!VAD.speaking && VAD.hot >= (talking ? 3 : 1)) {   // ★ 1 帧即触发，反应更快
+        if (!VAD.speaking && VAD.hot >= (talking ? 4 : 2)) {
             VAD.speaking = true; VAD.ever = true; onUserVoiceStart();
         }
     } else {
@@ -7073,50 +6936,12 @@ function vadLoop() {
         }
     }
     /* 单句最长 15 秒强制切段 */
-    if (!PTT.on && REC.on && now - REC.t0 > 22000) recCut(REC.hadVoice);   // 长句子不被腰斩
-    if (!PTT.on && REC.on && !VAD.speaking && !REC.hadVoice && now - REC.t0 > 9000) recCut(false);
+    if (REC.on && now - REC.t0 > 22000) recCut(REC.hadVoice);      // ★ 长句子不再被腰斩
+    if (REC.on && !VAD.speaking && !REC.hadVoice && now - REC.t0 > 9000) recCut(false);
     /* 一直没听到人声 → 明确提示（解决"没有识别状态显示"） */
     if (!VAD.ever && !talking && now - VAD.t0 > 9000 && now - VAD.warnTs > 9000) {
         VAD.warnTs = now; vcStatus('⚠ 没听到人声，请靠近手机说话');
     }
-}
-
-/* ==========================================================================
-   ★★★ 2026.8.28【整句合并 + 串行识别 + 按住说话】★★★
-   解决"东一句西一句 / 抢话"：
-   ① 识别出的片段先进缓冲区攒 1.3 秒，看还有没有后续 → 合成一整句只发一次
-   ② 所有 ASR 请求串行排队，绝不会因为网络快慢导致前后颠倒
-   ③ 🎤 按住说话：完全绕开自动判断，按住讲、松手识别，万无一失
-   ========================================================================== */
-const PTT  = { on: false };                    // 按住说话状态
-const PEND = { txt: '', timer: null };         // 整句合并缓冲区
-let _bargeTimer = null;                        // 延迟打断定时器
-let _asrChain = Promise.resolve();             // ASR 串行链
-
-function pendClear() { clearTimeout(PEND.timer); PEND.timer = null; PEND.txt = ''; }
-
-function _pendFlush() {
-    clearTimeout(PEND.timer); PEND.timer = null;
-    const t = String(PEND.txt || '').trim();
-    PEND.txt = '';
-    if (!t || t.replace(/[，。、！？,.!?\s]/g, '').length < 2) { vcStatus('● 聆听中'); return; }
-    vcStatus('👤 ' + t.slice(0, 14));
-    sendChat(t);
-}
-
-/* 把一段识别结果放进缓冲区。你中途停顿、分两三口气说完的一整句话，
-   会被拼成一句发给 AI → 从此不再自己打断自己、不再东一句西一句 */
-function pendPush(t) {
-    const clean = String(t || '').trim();
-    if (!clean) return;
-    PEND.txt = PEND.txt ? (PEND.txt + '，' + clean) : clean;
-    clearTimeout(PEND.timer);
-    const bare = PEND.txt.replace(/[，。、！？,.!?\s]/g, '');
-    /* 已经说得够长、又以明显的句末语气收尾 → 立刻发，不用干等 */
-    if (bare.length >= 20 && /[。！？?!吗呢吧啊呀嘛]$/.test(clean)) { _pendFlush(); return; }
-    if (bare.length >= 42) { _pendFlush(); return; }          // 太长了先发，别憋着
-    vcStatus('👂 ' + PEND.txt.slice(-14) + '…');
-    PEND.timer = setTimeout(_pendFlush, 1300);                 // ★ 等 1.3 秒看有没有后续
 }
 
 /* ---------- 连续录音 + 静音切段 → 云端识别（开头一个字都不会丢） ---------- */
@@ -7153,17 +6978,12 @@ function recCut(send) {
     REC.sendIt = !!send;
     try { REC.mr.stop(); } catch (e) { REC.on = false; }
 }
-/* ★ 改为"串行排队"：每一段录音按先后顺序识别，绝不会因为网速导致前后颠倒 */
-function sfASRSend() {
+async function sfASRSend() {
     const type = REC.mime || 'audio/webm';
     const blob = new Blob(REC.chunks, { type: type });
     REC.chunks = [];
-    if (blob.size < 900) { if (!PEND.txt) vcStatus('● 聆听中'); return; }
+    if (blob.size < 900) { vcStatus('● 聆听中'); return; }
     REC.busy = true; vcStatus('○ 识别中…');
-    _asrChain = _asrChain.then(() => _sfASRDo(blob, type)).catch(() => { REC.busy = false; });
-}
-
-async function _sfASRDo(blob, type) {
     const ctl = new AbortController();
     const to = setTimeout(() => { try { ctl.abort(); } catch (e) {} }, 16000);
     try {
@@ -7182,13 +7002,10 @@ async function _sfASRDo(blob, type) {
         let t = (j && (j.text || (j.results && j.results[0] && j.results[0].text))) || '';
         t = String(t).replace(/<\|[^|]*\|>/g, '').replace(/\s+/g, '').trim();
         REC.busy = false;
-        if (t.replace(/[，。、！？,.!?]/g, '').length < 1) { if (!PEND.txt) vcStatus('● 聆听中'); return; }
-        /* 回声过滤：她自己的声音不算你说话 */
-        if ((ttsSpeaking || Date.now() - SPEAK_END_TS < 1200) && looksLikeEcho(t)) {
-            if (!PEND.txt) vcStatus('● 聆听中');
-            return;
-        }
-        pendPush(t);                                  // ★ 不再直接发，先进合并缓冲区
+        if (t.replace(/[，。、！？,.!?]/g, '').length < 2) { vcStatus('● 聆听中'); return; }
+        if ((ttsSpeaking || Date.now() - SPEAK_END_TS < 1200) && looksLikeEcho(t)) { vcStatus('● 聆听中'); return; }
+        vcStatus('👤 ' + t.slice(0, 12));
+        sendChat(t);
     } catch (e) {
         clearTimeout(to); REC.busy = false;
         asrFallbackLocal('识别失败(' + ((e && e.message) || '') + ')');
@@ -7207,16 +7024,10 @@ function onUserVoiceStart() {
     if (!VC.on || !recOn) return;
     VAD.speechStart = Date.now();
     clearTimeout(REC.cutTimer);
-    /* ★ 不再"一有响声就打断"：先等 420ms，确认你真的在说话才掐断她
-       → 咳嗽、椅子响、她自己的尾音，都不会再把她打断 */
-    clearTimeout(_bargeTimer);
     if (ttsSpeaking && VC.set.barge && Date.now() > recGuardTo) {
-        _bargeTimer = setTimeout(() => {
-            if (!VAD.speaking || !ttsSpeaking) return;      // 只是杂音 → 不打断
-            try { if (VC._ctl) VC._ctl.abort(); } catch (e) {}
-            chatToken++; VC.busy = false;
-            ttsStop(); vcSub(''); vcStatus('● 我在听（已打断）');
-        }, 420);
+        try { if (VC._ctl) VC._ctl.abort(); } catch (e) {}
+        chatToken++; VC.busy = false;
+        ttsStop(); vcSub(''); vcStatus('● 我在听（已打断）');
     }
     if (useCloudASR()) {
         REC.hadVoice = true;
@@ -7224,18 +7035,14 @@ function onUserVoiceStart() {
         vcStatus('● 我在听…');
     } else recKick();
 }
-
 function onUserVoiceEnd() {
-    clearTimeout(_bargeTimer);
-    if (PTT.on) return;                                     // 按住说话时由手指控制
     if (!useCloudASR()) return;
     clearTimeout(REC.cutTimer);
     const dur = Date.now() - (VAD.speechStart || 0);
-    if (dur < 200) { REC.hadVoice = false; if (!PEND.txt) vcStatus('● 聆听中'); return; }
-    /* ★ 620ms → 1150ms：你换气、想词那一下不会再被切成两句 */
+    if (dur < 320) { REC.hadVoice = false; vcStatus('● 聆听中'); return; }
     REC.cutTimer = setTimeout(() => {
         if (!VAD.speaking && REC.on && REC.hadVoice) recCut(true);
-    }, 1150);
+    }, 620);                                    // ★ 说话中途停顿一下不会被切断，整句更完整
 }
 function recKick() {
     if (!recOn || !SR_CLS || recActive || !recObj) return;
@@ -7262,7 +7069,6 @@ function isEcho(t) {
 /* ---------- 启停 ---------- */
 function recStop() {
     recOn = false; recActive = false; clearTimeout(recTimer); recBuf = '';
-    try { pendClear(); clearTimeout(_bargeTimer); PTT.on = false; } catch (e) {}
     clearTimeout(REC.cutTimer); REC.busy = false; REC.hadVoice = false; REC.sendIt = false;
     try { if (REC.mr) { REC.mr.onstop = null; REC.mr.ondataavailable = null; if (REC.on) REC.mr.stop(); } } catch (e) {}
     REC.on = false; REC.chunks = []; REC.mr = null;
@@ -7345,11 +7151,9 @@ async function recStart() {
    优先级：WebXR原始相机 → 后置摄像头 → 屏幕共享 → 幻境画布
    ========================================================================== */
 const VIS_MODELS = [
-    'Qwen/Qwen2.5-VL-32B-Instruct',
-    'Qwen/Qwen2.5-VL-7B-Instruct',
-    'Qwen/Qwen3-VL-8B-Instruct',
-    'Qwen/Qwen2-VL-72B-Instruct',
-    'THUDM/GLM-4.1V-9B-Thinking'
+    'doubao-1.5-vision-pro-32k-250115',
+    'doubao-vision-pro-32k-240804',
+    'doubao-1.5-vision-lite-250115'
 ];
 const VIS = { on:false, mode:'', stream:null, video:null, cv:null, ctx:null,
               rawOK:false, binding:null, fbo:null, want:false, wantCanvas:false,
@@ -7869,7 +7673,6 @@ function chatSysPrompt(name) {
         '  3) 常识锚点（必背，答错就是严重错误）：500×500mm 地砖每平方米 4 块；600×600 是 2.78 块；300×600 是 5.56 块；800×800 是 1.56 块；200×100 面包砖是 50 块。绝不可能出现"每平方米几百块"这种答案。',
         '  4) 报价、用量一律说明是估算区间，并提醒按当地市场核价。',
         '【听不清怎么办】用户的话来自语音识别，可能有错别字或同音字，请按上下文合理理解；实在听不懂就用一句话反问澄清，不要瞎猜乱答。',
-        '【不许抢话·极重要】用户的一句话可能被语音识别切成两三段拼在一起（中间用逗号相连），所以你收到的内容整体才是他的完整意思。必须先把整段读完、理解他真正想问什么，再针对"最后那个真正的问题"作答。绝对禁止：只抓住开头几个字就抢着回答；把一句话当成两个问题分别回答；上一句刚说一半又换个话题。每次回答只围绕一个主题，一次说完整。',
         lenRule,
         '【情感格式·必须遵守】回答最开头先用一个中文方括号标情感，只能选：【开心】【温柔】【惊讶】【难过】【生气】【撒娇】【认真】【古风】，紧接着写内容，中间不空格不换行。例：【认真】这种情况一般先……',
         '除开头那个情感方括号外，正文里不要出现任何括号、星号、井号、表情符号、拼音或代码块；要像真人一样有语气起伏。'
@@ -8080,7 +7883,6 @@ function ensureVCUI() {
         '<span id="vc-who">人物</span>' +
         '<span id="vc-st">● 聆听中</span>' +
         '<span id="vc-lv"><i></i></span>' +
-        '<button class="vc-b" id="vc-ptt" title="按住我说话（最保险，绝不漏字）">🎤</button>' +
         '<button class="vc-b" id="vc-mic" title="暂停/继续聆听">🎙</button>' +
         '<button class="vc-b" id="vc-cut" title="打断朗读">🤫</button>' +
         '<button class="vc-b" id="vc-subbtn" title="字幕开关">💬</button>' +
@@ -8110,8 +7912,6 @@ function ensureVCUI() {
         '<div class="vc-r"><label>📝 回答长度</label><select id="vc-len">' +
             '<option value="short">智能（闲聊简短·算数教程讲透）</option>' +
             '<option value="long">全部详细</option></select></div>' +
-        '<div class="vc-r"><label>🎙 麦克风灵敏度 <span id="vc-mic-v">1.30</span>（越大越灵敏；戴耳机可拉到 2.0）</label>' +
-            '<input type="range" id="vc-mic" min="0.6" max="2.4" step="0.05"></div>' +
         '<div class="vc-sw" id="vc-sw-barge">✋ 我一开口就打断人物 <b>开</b></div>' +
         '<div class="vc-sw" id="vc-sw-emo">🎭 说话带情绪（开心/温柔/撒娇…） <b>开</b></div>' +
         '<div class="vc-sw" id="vc-sw-share">📷 共享画面给她看（她会记住环境） <b>关</b></div>' +
@@ -8162,7 +7962,7 @@ function ensureVCUI() {
     ms.value = VC.set.model;
     const sv = document.getElementById('vc-sfvoice');
     SF_VOICES.forEach(v => { const o = document.createElement('option'); o.value = v.id; o.text = v.name; sv.appendChild(o); });
-    sv.value = VC.set.sfVoice || 'bella';
+    sv.value = VC.set.sfVoice || 'zh_female_wanwanxiaohe_moon_bigtts';
     document.getElementById('vc-tts').value = VC.set.tts || 'cloud';
     document.getElementById('vc-asr').value = VC.set.asr || 'cloud';
     document.getElementById('vc-voice').value = VC.set.voice;
@@ -8205,45 +8005,6 @@ function ensureVCUI() {
     document.getElementById('vc-subbtn').onclick = () => { VC.set.sub = !VC.set.sub; swTxt(swS, VC.set.sub); vcSave(); vcRenderRows(); };
     document.getElementById('vc-cut').onclick = () => { ttsStop(); vcSub(''); vcStatus(recOn ? '● 聆听中' : '‖ 已暂停'); };
     document.getElementById('vc-mic').onclick = () => { if (recOn) { recStop(); vcStatus('‖ 已暂停聆听'); } else recStart(); };
-
-    /* ★ 灵敏度滑块 */
-    const _msl = document.getElementById('vc-micsens');
-    if (_msl) {
-        _msl.value = (VC.set.mic || 1.3);
-        document.getElementById('vc-micsens-v').innerText = Number(VC.set.mic || 1.3).toFixed(2);
-        _msl.oninput = (e) => {
-            VC.set.mic = parseFloat(e.target.value);
-            document.getElementById('vc-micsens-v').innerText = VC.set.mic.toFixed(2);
-            vcSave();
-        };
-    }
-
-    /* ★ 按住说话（PTT）：完全绕开自动判断，按住讲、松手识别，一个字都不会漏 */
-    const _ptt = document.getElementById('vc-ptt');
-    if (_ptt) {
-        const pttDown = (e) => {
-            if (e) { e.preventDefault(); e.stopPropagation(); }
-            PTT.on = true; _ptt.classList.add('on');
-            pendClear(); clearTimeout(_bargeTimer);
-            try { if (VC._ctl) VC._ctl.abort(); } catch (er) {}
-            chatToken++; VC.busy = false; ttsStop(); vcSub('');
-            if (!recOn) { try { recStart(); } catch (er) {} }
-            setTimeout(() => { REC.hadVoice = true; if (!REC.on) { try { recOpen(); } catch (er) {} } }, 60);
-            vcStatus('🎤 按住说话中…（松手识别）');
-        };
-        const pttUp = (e) => {
-            if (!PTT.on) return;
-            if (e) { e.preventDefault(); e.stopPropagation(); }
-            PTT.on = false; _ptt.classList.remove('on');
-            vcStatus('○ 识别中…');
-            REC.hadVoice = true;
-            setTimeout(() => { if (REC.on) recCut(true); }, 240);   // 留一点尾音再切
-        };
-        _ptt.addEventListener('pointerdown', pttDown);
-        _ptt.addEventListener('pointerup', pttUp);
-        _ptt.addEventListener('pointercancel', pttUp);
-        _ptt.addEventListener('pointerleave', pttUp);
-    }
     document.getElementById('vc-hang').onclick = () => closeChatPanel();
     document.getElementById('vc-hide').onclick = (e) => { e.stopPropagation(); vcBarHide(true); };
     const camGo = async () => {
