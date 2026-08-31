@@ -705,14 +705,6 @@ function ensureKTX2() {
 }
 const cloudModelCache = {}; 
 const loadingLocks = {};
-/* ★★★ 2026.8.27 新增：场景世代号 —— 根治"删不掉的幽灵模型" ★★★
-   清空 / 读档 / 深度清理时 sceneGen++，所有还在下载路上的模型回调
-   一发现世代号变了就自己作废，绝不会再偷偷 scene.add 回来。      */
-let sceneGen = 0;
-function bumpGen() {
-    sceneGen++;
-    for (const k in loadingLocks) delete loadingLocks[k];   // 作废所有排队中的回调
-}
 // ===== 外部贴图（草/砖/水）=====
 const EXT_TEX_LOADER = new THREE.TextureLoader();
 EXT_TEX_LOADER.setCrossOrigin('anonymous');
@@ -1051,17 +1043,8 @@ async function diagFile(file) {
     }
     return out.join('\n');
 }
-function getCloudModel(cloudId, onSuccess0) {
-    /* ★ 世代守卫：清空/读档之后，迟到的模型一律丢弃（幽灵模型的根治点） */
-    const _myGen = sceneGen;
-    const onSuccess = function (m) {
-        if (_myGen !== sceneGen) {
-            try { if (m && m.parent) m.parent.remove(m); } catch (e) {}
-            return;                                   // 世代已过期 → 直接扔掉，不进场景
-        }
-        onSuccess0(m);
-    };
-    if (cloudModelCache[cloudId]) {
+function getCloudModel(cloudId, onSuccess) {
+    if (cloudModelCache[cloudId]) { 
         const cloned = cloudModelCache[cloudId].clone();
         disableChildRaycast(cloned);
         cloned.userData.bbSize = cloudModelCache[cloudId].userData.bbSize;
@@ -1087,12 +1070,12 @@ function getCloudModel(cloudId, onSuccess0) {
         cloudModelCache[asset.id] = group;
         try { CLOUD_PROTOS.add(group); } catch (e) {}       // ★ 标记为"缓存原型"，永不算场景内容
         toast.style.display = 'none';
-        /* ★ 改用"离屏场景"预热着色器：缓存原型永远不会进入真实场景 → 断掉另一条幽灵来路 */
         try {
-            const _warm = new THREE.Scene();
-            _warm.add(group);
-            if (renderer.compile) renderer.compile(_warm, camera);
-            _warm.remove(group);
+            const oldPos = group.position.clone();
+            group.position.set(0, -10000, 0);
+            scene.add(group);
+            if (renderer.compile) renderer.compile(scene, camera);
+            group.position.copy(oldPos);
         } catch (e) {}
         try { if (group.parent) group.parent.remove(group); } catch (e) {}   // ★ 无论编译是否报错，都必须摘掉
         const cbs = loadingLocks[cloudId] || [];
@@ -3749,6 +3732,10 @@ function createObject(type, pos) {
             scene.add(model);
             placedObjects.push(model);
             selectObject(model);
+            /* ★首次AR放置人物 → 自动接通并做一次轻松自介（本地打标，后续不再触发） */
+            if (assetDef && assetDef.cat === 'cat_renwu' && !introDone()) {
+                setTimeout(() => { try { openChatPanel(model); } catch (e) {} }, 600);
+            }
         });
         return;
     }
@@ -3916,7 +3903,6 @@ function killSceneObject(o) {
 }
 /* 彻底清除所有幽灵（清空按钮、🗑按钮会用） */
 function purgeGhosts(silent) {
-    bumpGen();          // ★ 同上：先断掉下载队列，再铲场景残留
     const g = collectGhosts();
     g.forEach(o => killSceneObject(o));
     for (const k in cloudModelCache) {           // 顺手把可能残留的缓存原型摘掉
@@ -3957,7 +3943,6 @@ function doUndo() {
 }
 
 function doClear() {
-    bumpGen();          // ★ 先把所有"正在下载中的模型"作废，杜绝清完又冒出来
     placedObjects.forEach(o => { try { pruneSway(o); } catch (e) {} scene.remove(o); });
     placedObjects = []; windyGrassClusters = []; lotusClusters = [];
     cloudAnimObjects = []; swayObjects = [];
@@ -6086,20 +6071,8 @@ function rebuildOne(rec) {
 function deserializeScene(data) {
     if (!data || !data.objects) { showSysToast('存档为空'); return; }
     doClear();
-    /* ★ 存档去重：同一个模型在几乎同一位置的重复记录只保留 1 条
-       —— 这能把你之前已经存进去的"双份人物"一次性修好 */
-    const _seen = {}, _list = [];
-    (data.objects || []).forEach(rec => {
-        const P = rec.pos || [0, 0, 0];
-        const key = [rec.kind, rec.id, rec.modelId, rec.assetId,
-                     Math.round(P[0] * 50), Math.round(P[1] * 50), Math.round(P[2] * 50)].join('|');
-        if (_seen[key]) return;
-        _seen[key] = 1;
-        _list.push(rec);
-    });
-    const _dup = data.objects.length - _list.length;
-    _list.forEach(rec => { try { rebuildOne(rec); } catch (e) { console.warn('恢复失败', e); } });
-    showSysToast('✅ 幻境已读取 (' + _list.length + ' 项' + (_dup ? '，已自动清掉 ' + _dup + ' 个重复' : '') + ')');
+    data.objects.forEach(rec => { try { rebuildOne(rec); } catch (e) { console.warn('恢复失败', e); } });
+    showSysToast('✅ 幻境已读取 (' + data.objects.length + ' 项)');
 }
 
 /* ====== ★ 2026.8.20 新增：材料清单（植物 / 铺装面积 / 构件）统计 + 导出 ★ ====== */
@@ -6374,12 +6347,12 @@ function setupArchiveAndMusic() {
    ========================================================================== */
 
 /* ┌────────── ① 硅基流动密钥（已填好你的 Key）──────────┐ */
-const SF_API_KEY = 'ark-96d49cd7-014b-4039-920c-28f37f6e6cad-356f0';
+const SF_API_KEY = 'sk-gsdluvqusknqgancpkkvmzziwvweequmsgtlannylbvckjab';
 /* └────────────────────────────────────────────────────┘ */
 
 /* 接口地址（OpenAI 完全兼容）。若手机报"跨域/CORS失败"，把你的代理前缀填进 SF_PROXY */
-const SF_BASE  = 'https://ark.cn-beijing.volces.com/api/v3';
-const SF_PROXY = ''; /* 火山引擎国内直连，一般不需要代理 */
+const SF_BASE  = 'https://api.siliconflow.cn/v1';
+const SF_PROXY = '';
 function sfURL(p) { return SF_PROXY ? (SF_PROXY + SF_BASE + p) : (SF_BASE + p); }
 function SF_CHAT_URL() { return sfURL('/chat/completions'); }
 function SF_TTS_URL()  { return sfURL('/audio/speech'); }
@@ -6388,24 +6361,31 @@ const AGNES_API_KEY = SF_API_KEY;   /* 兼容旧变量名，别删 */
 
 /* ★② 对话模型：已按「性价比 + 速度」排好序，第一个是默认，失败自动往下降级
    价格仅供参考，最终以 https://cloud.siliconflow.cn/models 为准 */
-/* ★ 2026.8.27 重排：按"聪明程度 + 语音通话速度"排序，第一个是默认
-   askAI 自带自动降级：某个模型不可用会自动往下试，绝不会打不通 */
 const AGNES_MODELS = [
-    { id: 'doubao-1.5-pro-32k-250115',  name: '① 豆包1.5-Pro-32k【推荐·性价比最高】' },
-    { id: 'doubao-pro-32k-240615',      name: '② 豆包Pro-32k【经典稳定版】' },
-    { id: 'doubao-1.5-lite-32k-250115', name: '③ 豆包1.5-Lite-32k【超快超省钱】' },
-    { id: 'doubao-lite-32k-240615',     name: '④ 豆包Lite-32k【便宜备用】' },
-    { id: 'doubao-1.5-pro-128k-250115', name: '⑤ 豆包1.5-Pro-128k【超长上下文】' },
-    { id: 'doubao-lite-4k-240515',      name: '⑥ 豆包Lite-4k【最省钱兜底】' }
+    { id: 'Qwen/Qwen3-8B',            name: '① Qwen3-8B　【免费·最快·首选】' },
+    { id: 'Qwen/Qwen2.5-7B-Instruct', name: '② Qwen2.5-7B　【免费·备用】' },
+    { id: 'THUDM/GLM-4-9B-0414',      name: '③ GLM-4-9B　约¥0.6/百万·情感好' },
+    { id: 'Qwen/Qwen3-14B',           name: '④ Qwen3-14B　约¥0.7/百万·更聪明' },
+    { id: 'zai-org/GLM-4.5-Air',      name: '⑤ GLM-4.5-Air　约¥1入/¥6出·很聪明' },
+    { id: 'deepseek-ai/DeepSeek-V3',  name: '⑥ DeepSeek-V3　最聪明·最贵' }
 ];
 const SF_MODELS = AGNES_MODELS;
 
 /* ★③ 云端情感语音（TTS）：比手机自带朗读像真人得多 */
-const SF_TTS_MODEL = 'doubao-tts-hd';
-
+const SF_TTS_MODEL = 'FunAudioLLM/CosyVoice2-0.5B';
+const SF_VOICES = [
+    { id: 'bella',    name: '🌸 Bella 温柔女声（推荐·最像豆包）' },
+    { id: 'anna',     name: '💃 Anna 活力女声' },
+    { id: 'diana',    name: '😄 Diana 甜美女声' },
+    { id: 'claire',   name: '🍃 Claire 轻柔女声' },
+    { id: 'alex',     name: '🎧 Alex 沉稳男声' },
+    { id: 'charles',  name: '🎙 Charles 磁性男声' },
+    { id: 'benjamin', name: '🔊 Benjamin 低沉男声' },
+    { id: 'david',    name: '☀️ David 欢快男声' }
+];
 
 /* ★④ 云端语音识别（ASR）：SenseVoiceSmall，免费、中文准、不卡、没有叮咚提示音 */
-const SF_ASR_MODEL = 'doubao-asr';
+const SF_ASR_MODEL = 'FunAudioLLM/SenseVoiceSmall';
 
 /* ★⑤ 情感 → CosyVoice2 语气指令（AI 会自己在开头标【情感】） */
 const SF_EMO = {
@@ -6613,19 +6593,15 @@ const SF_SILENT = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIh
 /* ★ 强制迁移到"最优方式"：云端识别 + 云端情感语音（旧手机存的 local 会被纠正回来） */
 if (VC.set.tts     === undefined) VC.set.tts = 'cloud';
 if (VC.set.asr     === undefined) VC.set.asr = 'cloud';
-if (VC.set.sfVoice === undefined) VC.set.sfVoice = 'zh_female_wanwanxiaohe_moon_bigtts';
+if (VC.set.sfVoice === undefined) VC.set.sfVoice = 'bella';
 if (VC.set.emo     === undefined) VC.set.emo = true;
-if (VC.set._v !== 5) {                       // 只纠正一次
-    VC.set._v = 5;
-    VC.set.tts = 'cloud';                    // 默认豆包云端语音
-    VC.set.asr = 'cloud';                    // 默认云端识别
-    VC.set.rate = 1.00; VC.set.pitch = 1.02; // 自然语速音调
-    VC.set.sfVoice = 'zh_female_wanwanxiaohe_moon_bigtts'; // 重置为豆包音色
+if (VC.set._v !== 3) {                       // 只纠正一次
+    VC.set._v = 3;
+    VC.set.tts = 'cloud';                    // 默认云端情感语音
+    VC.set.asr = 'cloud';                    // 默认云端识别（不选浏览器）
+    VC.set.rate = 1.00; VC.set.pitch = 1.02; // 更自然，不发嗲
 }
-if (String(VC.set.model || '').indexOf('Qwen') === 0 ||
-    String(VC.set.model || '').indexOf('deepseek') === 0 ||
-    String(VC.set.model || '').indexOf('zai-org') === 0 ||
-    String(VC.set.model || '').indexOf('agnes') === 0 ||
+if (String(VC.set.model || '').indexOf('agnes') === 0 ||
     AGNES_MODELS.findIndex(m => m.id === VC.set.model) < 0) VC.set.model = AGNES_MODELS[0].id;
 vcSave();
 
@@ -6698,10 +6674,12 @@ async function sfTTS(text, emo) {
             headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + SF_API_KEY },
             body: JSON.stringify({
                 model: SF_TTS_MODEL,
-                input: text,
-                voice: VC.set.sfVoice || 'zh_female_wanwanxiaohe_moon_bigtts',
+                input: (ins ? (ins + '<|endofprompt|>') : '') + text,
+                voice: SF_TTS_MODEL + ':' + (VC.set.sfVoice || 'bella'),
                 response_format: 'mp3',
-                speed: Math.max(0.5, Math.min(2, VC.set.rate || 1))
+                sample_rate: 32000,
+                speed: Math.max(0.5, Math.min(2, VC.set.rate || 1)),
+                gain: 0
             })
         });
         clearTimeout(to);
@@ -7151,9 +7129,11 @@ async function recStart() {
    优先级：WebXR原始相机 → 后置摄像头 → 屏幕共享 → 幻境画布
    ========================================================================== */
 const VIS_MODELS = [
-    'doubao-1.5-vision-pro-32k-250115',
-    'doubao-vision-pro-32k-240804',
-    'doubao-1.5-vision-lite-250115'
+    'Qwen/Qwen2.5-VL-32B-Instruct',
+    'Qwen/Qwen2.5-VL-7B-Instruct',
+    'Qwen/Qwen3-VL-8B-Instruct',
+    'Qwen/Qwen2-VL-72B-Instruct',
+    'THUDM/GLM-4.1V-9B-Thinking'
 ];
 const VIS = { on:false, mode:'', stream:null, video:null, cv:null, ctx:null,
               rawOK:false, binding:null, fbo:null, want:false, wantCanvas:false,
@@ -7429,212 +7409,37 @@ async function liveWeather(q) {
         return s;
     } catch (e) { clearTimeout(to); return ''; }
 }
-/* ==========================================================================
-   ★★★ 2026.8.27 新增：精确计算引擎 + 园林工程知识库 + 中式风水库 + 联网百科
-   核心思想：所有数字由前端 JS 算好再交给 AI，AI 只负责"说人话"
-   → 从此再也不会出现"500×500地砖每平方400块"这种离谱错误
-   ========================================================================== */
-
-/* ---------- ① 数字格式化 ---------- */
-function _mFix(v, d) {
-    const n = Number(v);
-    if (!isFinite(n)) return '0';
-    let s = n.toFixed(d === undefined ? 2 : d);
-    if (s.indexOf('.') >= 0) s = s.replace(/0+$/, '').replace(/\.$/, '');
-    return s || '0';
-}
-
-/* ---------- ② 安全算式求值（支持中文符号、百分号） ---------- */
-function safeCalc(expr) {
-    let e = String(expr)
-        .replace(/[×xX✕＊·]/g, '*').replace(/[÷]/g, '/')
-        .replace(/（/g, '(').replace(/）/g, ')')
-        .replace(/＋/g, '+').replace(/[－—–]/g, '-')
-        .replace(/[,，\s]/g, '');
-    if (!/^[0-9.+\-*/()%]+$/.test(e)) return null;
-    e = e.replace(/%/g, '/100');
-    if (!/[+\-*/]/.test(e)) return null;
-    try {
-        const v = Function('"use strict";return(' + e + ')')();
-        return (typeof v === 'number' && isFinite(v)) ? v : null;
-    } catch (err) { return null; }
-}
-
-/* ---------- ③ 铺装规格 → 每平方米块数（核心！） ---------- */
-function paveCalcLines(q) {
-    const out = [];
-    const rx = /(\d{2,4})\s*[*×xX✕＊·\-－]\s*(\d{2,4})/g;
-    let m, n = 0;
-    while ((m = rx.exec(q)) !== null && n < 3) {
-        const a = parseFloat(m[1]), b = parseFloat(m[2]);
-        if (!(a >= 30 && a <= 3000 && b >= 30 && b <= 3000)) continue;
-        const one = a * b / 1000000;          // 单块面积 m²
-        const per = 1 / one;                  // 每平方米块数
-        out.push('规格 ' + a + '×' + b + 'mm：单块 ' + _mFix(one, 4) + '㎡；'
-            + '每平方米需 ' + _mFix(per, 2) + ' 块；'
-            + '按 5% 损耗备料 ' + _mFix(per * 1.05, 2) + ' 块/㎡；'
-            + '10㎡ 需 ' + Math.ceil(per * 10 * 1.05) + ' 块；100㎡ 需 ' + Math.ceil(per * 100 * 1.05) + ' 块');
-        n++;
-    }
-    return out;
-}
-
-/* ---------- ④ 面积 / 周长 / 圆 / 体积 ---------- */
-function geoCalcLines(q) {
-    const out = [];
-    const m = q.match(/([\d.]+)\s*(?:米|m|M)?\s*[*×xX✕]\s*([\d.]+)\s*(?:米|m|M)/);
-    if (m) {
-        const a = parseFloat(m[1]), b = parseFloat(m[2]);
-        if (a > 0 && b > 0 && a < 999 && b < 999)
-            out.push('矩形 ' + a + 'm × ' + b + 'm：面积 ' + _mFix(a * b) + '㎡，周长 ' + _mFix(2 * (a + b)) + 'm');
-    }
-    const r = q.match(/(直径|半径|⌀|直经)\s*([\d.]+)\s*(mm|毫米|cm|厘米|m|米)?/);
-    if (r) {
-        let v = parseFloat(r[2]);
-        const u = r[3] || 'mm';
-        if (/mm|毫米/.test(u)) v /= 1000; else if (/cm|厘米/.test(u)) v /= 100;
-        if (v > 0 && v < 300) {
-            const R = /半径/.test(r[1]) ? v : v / 2;
-            out.push(r[1] + ' ' + r[2] + (r[3] || 'mm') + '：圆面积 ' + _mFix(Math.PI * R * R)
-                + '㎡，周长 ' + _mFix(2 * Math.PI * R) + 'm');
-        }
-    }
-    const d = q.match(/([\d.]+)\s*(?:米|m)?\s*(?:深|厚)/);
-    if (d && out.length) {
-        const h = parseFloat(d[1]);
-        const am = out[0].match(/面积\s*([\d.]+)/);
-        if (am && h > 0 && h < 20)
-            out.push('乘以深/厚 ' + h + 'm → 体积 ' + _mFix(parseFloat(am[1]) * h, 3)
-                + 'm³（水体则约 ' + _mFix(parseFloat(am[1]) * h * 1000, 0) + ' 升 ≈ ' + _mFix(parseFloat(am[1]) * h, 2) + ' 吨）');
-    }
-    return out;
-}
-
-/* ---------- ⑤ 纯算式 / 单价×数量 ---------- */
-function exprCalcLines(q) {
-    const out = [];
-    const rx = /[\d.]+\s*(?:[+\-*/×xX÷＋－]\s*[\d.]+\s*)+/g;
-    let m, n = 0;
-    while ((m = rx.exec(q)) !== null && n < 3) {
-        const raw = m[0].trim();
-        if (raw.replace(/[^\d]/g, '').length < 2) continue;
-        const v = safeCalc(raw);
-        if (v !== null) { out.push('算式 ' + raw + ' = ' + _mFix(v, 4)); n++; }
-    }
-    return out;
-}
-
-/* ---------- ⑥ 园林工程量知识库（照做级） ---------- */
-const GARDEN_KB = [
-'【铺装块数公式】每㎡块数 = (1000÷长mm) × (1000÷宽mm)。500×500→4块/㎡；600×600→2.78块/㎡；300×600→5.56块/㎡；400×400→6.25块/㎡；800×800→1.56块/㎡；300×300→11.11块/㎡；200×100面包砖→50块/㎡。方形铺损耗3%~5%，弧形异形碎拼8%~12%。',
-'【铺装做法】素土夯实→100~150mm C15素混凝土垫层→30mm 1:3干硬性水泥砂浆→面层。1:3砂浆30mm厚每㎡约0.03m³，需水泥约12kg、中砂约0.033m³。透水铺装用级配碎石150mm+透水找平层。',
-'【草坪】草卷按面积×1.05~1.10备货（搭接修边）；冷季型草籽15~25g/㎡，暖季型8~15g/㎡；铺前种植土厚15~20cm并整坡3‰~5‰排水。',
-'【地被灌木株数】株行距20×20cm→25株/㎡；25×25→16株/㎡；30×30→11株/㎡；35×35→8株/㎡；40×40→6.25株/㎡；50×50→4株/㎡；公式=1÷(株距m×行距m)。',
-'【乔木间距】胸径8~10cm株距3~4m；12~15cm株距4~5m；18~20cm株距5~7m；绿篱小苗3~5株/延米；丛生竹丛距1.5~2m。',
-'【种植土/树坑】树坑直径=土球径+40cm，深=土球高+20cm；灌木换土30~40cm厚，地被20~30cm，草坪15~20cm；1m³种植土约1.3~1.5吨。',
-'【水池】体积=水面面积×平均水深；观赏池水深0.4~0.8m，锦鲤池0.8~1.5m；1m³水=1000升=1吨；池底：100mm C20混凝土+双层防水+20mm保护层；循环泵流量按池体积每2~4小时循环一遍选型。',
-'【叠石驳岸】高0.4~0.6m时用石量约0.35~0.6吨/延米；每延米约需2~4块400~600mm块石；压顶石须向水面挑出5~10cm压住水线。',
-'【路缘石】常用100×200×500mm(每延米2块)或120×300×1000mm(每延米1块)；坐浆M7.5砂浆20~30mm，后背C15混凝土。',
-'【土方系数】自然土松散1.25~1.35；夯填压实0.90~0.93；干砂约1.45吨/m³，碎石约1.5吨/m³，土约1.6~1.8吨/m³。',
-'【单价参考·仅估算·必须提醒按当地核价】草坪25~60元/㎡；地被30~90元/㎡；透水砖80~150元/㎡；花岗岩火烧板200~450元/㎡；青石板碎拼130~260元/㎡；鹅卵石拼花150~350元/㎡；防腐木平台350~700元/㎡；仿木栏杆200~400元/延米；叠石驳岸600~1500元/延米；成品树池800~2500元/个。'
-];
-
-/* ---------- ⑦ 中式园林风水知识库 ---------- */
-const FENGSHUI_KB = [
-'【总纲】园林风水核心八字："藏风聚气，曲则有情"。四忌：忌直冲、忌反弓、忌尖角、忌闭塞。四宜：背有靠、前有照、明堂开阔、动线迂回。',
-'【水法】水宜曲不宜直；宜环抱(玉带水)不宜反弓(水弯外侧主破财)；来水宜见、去水宜隐；池塘忌正对大门直冲，忌紧贴宅前正中(塘压门)，宜偏东南或北侧；水面不宜超过庭院1/3；最忌死水浊水，须有循环与溢流。',
-'【方位五行】东方属木——宜竹、乔木、青绿；南方属火——宜花境、朱红小品；西方属金——宜白花、太湖石、金属雕塑；北方属水——宜水池、深色置石作靠山；中央属土——宜草坪平台，庭心忌栽大树、忌开深井(所谓"庭心不种树")。',
-'【植物宜忌】宜：桂(贵)、竹(节节高)、松(长寿)、石榴(多子)、玉兰海棠迎春牡丹(玉堂春富贵)、橘(吉)、罗汉松(守财)、南天竹(添丁)。忌：门前柳(留不住)、宅后桑(谐丧)、庭中杨(鬼拍手)、大片芭蕉贴窗(招阴湿)、带刺仙人掌正对门(口舌)。枯树死树必须及时清除。',
-'【置石假山】山宜有情不宜峥嶂：尖峰锐角不可正对门窗与座椅(尖角煞)，可用花木遮挡或转向；假山宜置宅之西北/北向作"靠山"，但不可堵采光通风；石头数量宜取单数；忌怪石当门。',
-'【道路动线】园路忌一条直路直冲大门(一箭穿心)，宜三弯九曲；台阶级数常取单数；汀步取奇数；拱桥不宜正对大门；主路宽1.2~1.5m，次路0.6~0.9m。',
-'【建筑小品】亭宜靠边不居中，亭口不冲门；石桌石凳忌置于大门正对处；镜面水景不宜正照门窗；照明宜柔和下照，忌强光直射卧室窗。',
-'【煞气化解】路冲角冲→设照壁/密植绿篱/置石屏；西晒→西侧种高大常绿乔木；西北风→西北植针叶林带；低洼积水→抬高微地形+盲沟+雨水花园。',
-'【表述纪律】必须说明这是传统文化与人居经验的说法，可作布局参考；最终仍以采光、通风、排水、安全、使用便利、造价为准，绝不迷信恐吓用户，不算命不断吉凶祸福。'
-];
-
-/* ---------- ⑧ 联网查资料（维基百科，支持跨域；连不上则静默跳过） ---------- */
-async function webLookup(q) {
-    let kw = String(q)
-        .replace(/[，。？！、,.?!；;：:""''""]/g, ' ')
-        .replace(/(请问|你知道|知道吗|告诉我|什么是|是什么|谁是|介绍一?下|说说|讲讲|详细|简单|的由来|的历史|的原理|的意思|吗|呢|啊|呀|了|的)/g, ' ')
-        .trim().split(/\s+/).filter(s => s.length >= 2).sort((a, b) => b.length - a.length)[0] || '';
-    if (kw.length < 2) return '';
-    const go = async (u) => {
-        const c = new AbortController();
-        const t = setTimeout(() => { try { c.abort(); } catch (e) {} }, 4500);
-        try { const r = await fetch(u, { signal: c.signal }); clearTimeout(t); return r.ok ? await r.json() : null; }
-        catch (e) { clearTimeout(t); return null; }
-    };
-    const API = 'https://zh.wikipedia.org/w/api.php?origin=*&format=json&';
-    let title = kw;
-    const os = await go(API + 'action=opensearch&limit=1&search=' + encodeURIComponent(kw));
-    if (os && os[1] && os[1][0]) title = os[1][0];
-    const ex = await go(API + 'action=query&prop=extracts&exintro=1&explaintext=1&redirects=1&titles=' + encodeURIComponent(title));
-    const pg = ex && ex.query && ex.query.pages;
-    if (!pg) return '';
-    for (const k in pg) {
-        const t = pg[k].extract;
-        if (t && t.length > 30)
-            return '【联网查到·' + title + '】' + String(t).replace(/\s+/g, ' ').slice(0, 400);
-    }
-    return '';
-}
-
-/* ---------- ⑨ 触发词 ---------- */
-const RX_VIS  = /(看一?下|看看|画面|镜头|拍到|这是什么|这是啥|识别一?下|认一?下|我周围|周围有什么|我面前|眼前|屏幕上|前面是什么)/;
-const RX_LAY  = /(景观|造景|布置|铺装|路径|水池|池塘|花池|树池|栏杆|凉亭|假山|草地|绿化|种植|摆放|放哪|摆哪|设计方案|平面|间距|面积)/;
-const RX_WX   = /(天气|气温|温度|下雨|降雨|台风|风力|湿度|冷不冷|热不热|晴天|阴天|下雪)/;
-const RX_MATH = /(算|计算|多少|几块|几片|几株|几棵|几袋|几吨|几方|几米|用量|需要多少|平方|平米|㎡|立方|m3|m³|造价|报价|单价|多少钱|预算|工程量|等于|加|减|乘|除|百分|打折|面积|周长|体积|株距|行距|间距|损耗|规格|×|x\s*\d)/;
-const RX_ENG  = /(铺装|地砖|地板|石材|花岗岩|青石|透水砖|草坪|草卷|草籽|苗木|乔木|灌木|地被|种植土|土球|树坑|驳岸|叠石|路缘石|水池|池塘|防水|砂浆|水泥|碎石|土方|回填|做法|工序|施工|养护|定额)/;
-const RX_FS   = /(风水|朝向|方位|吉凶|禁忌|忌|煞|藏风|聚气|明堂|靠山|反弓|财位|五行|八卦|坎|离|震|兑|生气|镇宅|运势|讲究|好不好|适合放|该放哪)/;
-const RX_KN   = /(是什么|什么是|谁是|哪一年|哪年|由来|典故|历史|原理|区别|怎么来的|介绍一?下|出自|作者|发明|定义)/;
-
-/* ---------- ⑩ 组装即时资料包 ---------- */
+/* ---------- 给 AI 的即时资料包 ---------- */
+/* ★ 收紧：只有真的在问"画面/造景/天气"时才注入资料，否则AI会被带跑题 */
+const RX_VIS = /(看一?下|看看|画面|镜头|拍到|这是什么|这是啥|识别一?下|认一?下|我周围|周围有什么|我面前|眼前|屏幕上|前面是什么)/;
+const RX_LAY = /(景观|造景|布置|铺装|路径|水池|池塘|花池|树池|栏杆|凉亭|假山|草地|绿化|种植|摆放|放哪|摆哪|设计方案|平面|间距|面积)/;
+const RX_WX  = /(天气|气温|温度|下雨|降雨|台风|风力|湿度|冷不冷|热不热|晴天|阴天|下雪)/;
+/* ★内置「景观风水 + 工程尺寸」知识库：用户问造景/布局时自动喂给AI，配合实时朝向/坐标使用 */
+const LANDSCAPE_KB = [
+    '【坐向与明堂】理想格局"前朱雀、后玄武、左青龙、右白虎"：宅前留开阔明堂（视野/水景/草坪）聚气；宅后宜有靠山（假山、乔木林、景墙）为依托；坐北朝南采光最佳。',
+    '【水法】水宜曲折环抱、缓流有情，忌直冲大门、忌反弓；池塘忌正对大门中轴，宜偏于一侧；水面不宜过大压过建筑，池岸宜做自然驳岸。',
+    '【植物宜忌】大门与窗前忌高大乔木正对遮挡；庭院正中心忌种大树；宜前低后高、层次分明；带刺、枯木、藤缠忌近主入口。',
+    '【园路尺寸】主园路宽1.2~2.0m（双人并行取1.5m）；次园路0.6~1.0m；汀步中心间距55~65cm、单块约40×50cm；步道纵坡宜<8%。',
+    '【树池/种植】树池净直径乔木≥1.5m、大乔木≥2.0m；乔木株距4~6m，小乔木3~4m，大灌木1.5~2.5m，绿篱30~50cm，地被花卉15~30cm。',
+    '【水景/铺装】观赏水池水深0.3~0.6m（安全<0.6m）；驳岸石露出水面10~20cm；铺装找坡1%~2%排水；台阶踏步高12~16cm、宽30~35cm。',
+    '【景亭/构筑】亭子净高2.4~2.8m、六角亭对角3~4m；园桥净宽≥1.2m；临水/临空栏杆高≥1.05m。',
+    '答景观问题时：先按用户给的坐向/场地实况判断格局优劣，再给"具体位置+推荐尺寸+植物/材料"的可落地建议，能用本软件的路径/铺装/水池/树池/组合种植功能实现的就顺带告诉他怎么点。'
+].join('\n');
 async function buildContext(text) {
     const parts = [];
-
-    /* A. 精确计算（最高优先，命中即注入；AI 必须原样采用这些数字） */
-    if (RX_MATH.test(text)) {
-        const calc = [].concat(paveCalcLines(text), geoCalcLines(text), exprCalcLines(text));
-        if (calc.length)
-            parts.push('【★系统精确计算结果·必须原样采用，禁止自行心算★】\n' + calc.join('\n'));
-    }
-
-    /* B. 园林工程数据 */
-    if (RX_ENG.test(text) || RX_MATH.test(text))
-        parts.push('【园林工程量与做法数据】\n' + GARDEN_KB.join('\n'));
-
-    /* C. 中式风水 */
-    if (RX_FS.test(text))
-        parts.push('【中式园林风水要诀】\n' + FENGSHUI_KB.join('\n'));
-
-    /* D. 实时天气 */
     if (RX_WX.test(text)) { const w = await liveWeather(text); if (w) parts.push(w); }
-
-    /* E. 联网百科（连不上会自动跳过，不影响使用） */
-    if (RX_KN.test(text) && !RX_MATH.test(text)) {
-        vcStatus('🌐 联网查资料…');
-        try { const wk = await webLookup(text); if (wk) parts.push(wk); } catch (e) {}
-    }
-
-    /* F. 场地实况 */
-    if (RX_LAY.test(text) || RX_FS.test(text)) parts.push('【场地实况】\n' + sceneFacts());
-
-    /* G. 共享画面 */
+    if (RX_LAY.test(text)) parts.push('【景观造景·风水与尺寸规则】\n' + LANDSCAPE_KB + '\n【场地实况】\n' + sceneFacts());
     if (VIS.on && RX_VIS.test(text)) {
         vcStatus('👀 正在看画面…');
         try {
             const d = await sfVision('用不超过60个汉字客观描述这张画面：主要物体、材质颜色、各自在画面左/中/右、大概远近。只输出描述。', 150);
             if (d) parts.push('【你此刻看到的画面】' + d);
         } catch (e) {}
-    } else if (VIS.on && VIS.mem.length && (RX_LAY.test(text) || RX_FS.test(text))) {
+    } else if (VIS.on && VIS.mem.length && RX_LAY.test(text)) {
         parts.push('【你看过的环境记忆】' + VIS.mem.slice(-8).join('；'));
     }
-
     if (!parts.length) return '';
-    return '以下是系统给你的实时资料。规则：①凡带"系统精确计算结果"的数字，必须一字不改地采用，绝不许自己重新心算；'
-         + '②自然口语化地讲出来，不要复述格式、不要提"资料/系统"；③用户没问就不要主动播报位置和距离。\n'
-         + parts.join('\n');
+    return '以下是系统给你的实时资料，请自然地融进口语回答，不要复述格式、不要提"资料/系统"，也不要在用户没问的时候主动播报位置或距离：\n' + parts.join('\n');
 }
 /* ============ 五、调用硅基流动（OpenAI 兼容 · 流式 · 自动降级） ============ */
 /* ---------- 人物档案：谁问都答得出几岁、哪里来、谁做的 ---------- */
@@ -7650,11 +7455,8 @@ function charProf(name) { return CHAR_PROFILE[name] || CHAR_PROFILE._def; }
 function chatSysPrompt(name) {
     const p = charProf(name);
     const lenRule = (VC.set.len === 'short')
-        ? '这是【实时语音通话】，你的话会被立刻朗读。长度按需要自己判断：'
-          + '① 闲聊、问候、简单事实 → 1~3 句、40~120 字，说完就停；'
-          + '② 只要是计算、报价、材料清单、施工做法、风水布局、知识讲解、步骤教程 → 必须一次讲透，可以说到 200~450 字，'
-          + '按"先给答案 → 再给算式或步骤 → 最后一句提醒"的顺序，绝对不许说半句就断，也不许说"我先说这些"。'
-        : '这是语音通话，可以充分展开、条理清楚地讲，但要口语化，一般不超过 600 字。';
+        ? '这是【实时语音通话】，你的话会被立刻朗读。每次回答 1~4 句、约 40~140 字：第一句直接给答案，后面最多补 1~2 条关键要点，说完就停。宁可少说，也绝不能说半句就断。'
+        : '这是语音通话，可以更详细，但要口语化、条理清楚，尽量不超过 220 字。';
     return [
         '你叫「' + name + '」，是《AR幻境》里的3D虚拟人物，同时也是用户的【全能生活助手】，正在和用户实时语音通话。',
         '【身份】《AR幻境》由「新奇软件迷」独立开发（QQ 743108638，邮箱 huyufa73@gmail.com）。谁问你几岁、来自哪里、谁做的你、你是不是AI，都用人物口吻答：年龄——' + p.age + '；来处——' + p.from + '；由「新奇软件迷」创造。绝不能说"我是AI/语言模型/我没有年龄"。',
@@ -7664,26 +7466,19 @@ function chatSysPrompt(name) {
         '3. 除刚接通时那一次问候，之后一律不再自我介绍、不再重复身份。',
         '4. 不要说"还有什么可以帮你/需要我做什么"，不要客套反问，不要复述用户的话，不要主动播报周围物体的位置和距离。',
         '5. 没有实时数据（天气、新闻、行情等）就直说"我这儿拿不到实时数据"，再给通用建议，绝不编造具体数字、日期、价格。',
-        '【你的知识面必须极广，等同一位资深全能顾问】天文地理、历史文化、诗词典故、健康养生与常见用药、育儿教育、法律常识、金融保险、手机电脑与数码故障、编程与代码、考试学习方法、做菜烘焙、旅游攻略、汽车保养、家装水电、家电选购、宠物养护——问什么都要给条理清楚、能直接照做的答复。医疗只给一般性建议并提醒及时就医；不确定就明说不确定，绝不编造。',
-        '【专业强项一·园林景观】你精通中式园林与现代景观：植物配置与四季观赏、乔灌草层次、铺装材质与拼法、驳岸叠石、水景循环、微地形排水、苗木规格与养护、施工工序与验收、工程量与造价估算，能像施工图交底一样把做法说清楚。',
-        '【专业强项二·中式风水】你精通传统园林风水（形势派为主）：藏风聚气、曲则有情、四忌四宜、水法(玉带水/反弓水)、五行方位、植物宜忌、置石尖角煞、动线迂回、煞气化解。用户做景观时要主动结合风水给出可落地的布局建议。但必须说明这是传统人居经验，可作参考，最终以采光通风排水安全便利为准，绝不断吉凶祸福、不迷信恐吓。',
-        '【专业强项三·数学与算量·铁律】凡涉及数字，必须严格执行：',
-        '  1) 如果系统资料里给了"★系统精确计算结果★"，你必须一字不改地照用那些数字，绝对禁止自己重新心算或改写。',
-        '  2) 如果系统没给，你必须把算式一步步写出来再报答案，例如"每平方米块数 = 1000÷500 × 1000÷500 = 2×2 = 4 块"，禁止跳步直接报数。',
-        '  3) 常识锚点（必背，答错就是严重错误）：500×500mm 地砖每平方米 4 块；600×600 是 2.78 块；300×600 是 5.56 块；800×800 是 1.56 块；200×100 面包砖是 50 块。绝不可能出现"每平方米几百块"这种答案。',
-        '  4) 报价、用量一律说明是估算区间，并提醒按当地市场核价。',
+        '【知识面要全】天文地理、历史文化、健康养生与用药常识、育儿、法律常识、手机电脑数码、编程、考试学习、做菜、旅游、汽车、装修、园林植物养护与施工做法、造价估算，尤其精通庭院景观设计与布局、景观风水（坐向/明堂/靠山/水法/植物宜忌）、园林工程标准尺寸（园路宽度、汀步、树池、水深、乔灌草间距）等，问什么都要给条理清楚、能直接照做的答复；医疗只给一般性建议并提醒及时就医；不确定就说不确定。',
         '【听不清怎么办】用户的话来自语音识别，可能有错别字或同音字，请按上下文合理理解；实在听不懂就用一句话反问澄清，不要瞎猜乱答。',
         lenRule,
         '【情感格式·必须遵守】回答最开头先用一个中文方括号标情感，只能选：【开心】【温柔】【惊讶】【难过】【生气】【撒娇】【认真】【古风】，紧接着写内容，中间不空格不换行。例：【认真】这种情况一般先……',
         '除开头那个情感方括号外，正文里不要出现任何括号、星号、井号、表情符号、拼音或代码块；要像真人一样有语气起伏。'
     ].join('\n');
 }
-/* 只在"第一次打开这个人物"时说一次自我介绍，之后一个字都不主动说 */
+/* ★本地打标：整段幻境只自我介绍一次，之后永远静默、只答问题 */
+function introDone() { try { return localStorage.getItem('arhj_char_intro_v1') === '1'; } catch (e) { return false; } }
+function markIntroDone() { try { localStorage.setItem('arhj_char_intro_v1', '1'); } catch (e) {} }
+/* 只在"整段幻境第一次接通人物"时说一次自我介绍，之后一个字都不主动说 */
 function greetLine(name) {
-    const p = charProf(name);
-    return '公子你好！我是AR幻境里的全能助手' + name + '，' + p.age +
-           '。天文地理、养生医理、数码编程、做菜旅行、造园养花我都懂；'
-         + '园林算量、材料造价我会一步步算给你听，中式风水布局也能帮你参谋。你问哪一方面，我便答哪一方面。';
+    return '你好，我是新奇软件迷请来的，常住AR幻境里，能陪你聊、帮你算、还能指导做景观，啥都能聊。有事儿你尽管问我～';
 }
 async function askAI(history, sysPrompt, onDelta, alive) {
     if (!SF_API_KEY || String(SF_API_KEY).indexOf('sk-') !== 0)
@@ -7706,7 +7501,7 @@ async function askAI(history, sysPrompt, onDelta, alive) {
                 temperature: 0.55,
                 top_p: 0.85,
                 frequency_penalty: 0.15,
-                max_tokens: (VC.set.len === 'short' ? 800 : 1800)
+                max_tokens: (VC.set.len === 'short' ? 340 : 900)
             };
             /* Qwen3 / GLM-4.5 默认会"先思考"，语音聊天必须关掉，否则要等好几秒 */
             if (/qwen3|glm-4\.5|glm-4\.6|glm-4\.7|hunyuan/i.test(order[k])) body.enable_thinking = false;
@@ -7910,8 +7705,7 @@ function ensureVCUI() {
         '<div class="vc-r"><label>🎚 音调 <span id="vc-pitch-v">1.25</span></label>' +
             '<input type="range" id="vc-pitch" min="0.4" max="1.8" step="0.05"></div>' +
         '<div class="vc-r"><label>📝 回答长度</label><select id="vc-len">' +
-            '<option value="short">智能（闲聊简短·算数教程讲透）</option>' +
-            '<option value="long">全部详细</option></select></div>' +
+            '<option value="short">简短（2~4句，适合语音）</option><option value="long">详细</option></select></div>' +
         '<div class="vc-sw" id="vc-sw-barge">✋ 我一开口就打断人物 <b>开</b></div>' +
         '<div class="vc-sw" id="vc-sw-emo">🎭 说话带情绪（开心/温柔/撒娇…） <b>开</b></div>' +
         '<div class="vc-sw" id="vc-sw-share">📷 共享画面给她看（她会记住环境） <b>关</b></div>' +
@@ -7962,7 +7756,7 @@ function ensureVCUI() {
     ms.value = VC.set.model;
     const sv = document.getElementById('vc-sfvoice');
     SF_VOICES.forEach(v => { const o = document.createElement('option'); o.value = v.id; o.text = v.name; sv.appendChild(o); });
-    sv.value = VC.set.sfVoice || 'zh_female_wanwanxiaohe_moon_bigtts';
+    sv.value = VC.set.sfVoice || 'bella';
     document.getElementById('vc-tts').value = VC.set.tts || 'cloud';
     document.getElementById('vc-asr').value = VC.set.asr || 'cloud';
     document.getElementById('vc-voice').value = VC.set.voice;
@@ -8059,13 +7853,14 @@ function openChatPanel(obj) {          // 名字保持不变：原来的"轻点�
     if (VC.set.share && !VIS.on) visStart();
 
     if (!same) {
-        if (obj.userData._chatLog.length === 0) {
-            const g = greetLine(characterName(obj));          // ★ 本地问候，零等待
+        if (!introDone()) {                                   // ★首次自介：全幻境仅一次
+            markIntroDone();
+            const g = greetLine(characterName(obj));
             obj.userData._chatLog.push({ role: 'assistant', content: g });
             recGuardTo = Date.now() + 420;
-            SF_EMO_NOW = '温柔';
+            SF_EMO_NOW = '开心';
             ttsSpeak(g);
-        } else vcStatus('● 已接通，请说话');
+        } else vcStatus('● 已接通，请说话');                   // ★之后默认静默，只等你提问
     }
 }
 function closeChatPanel() {
