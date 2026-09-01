@@ -140,7 +140,7 @@
         body.ui-hidden #btn-eye-toggle { display: flex !important; }
 
         /* ===== 青山绿水 · 极简工具坞（画布最大化） ===== */
-        #dock-toggle { position:fixed; left:8px; top:8px; z-index:160; width:42px; height:42px; font-size:18px;
+        #dock-toggle { position:fixed; left:8px; top:54px; z-index:160; width:42px; height:42px; font-size:18px;
             background:linear-gradient(150deg,#5fd3b4,#2e9c8a); border:2px solid rgba(255,255,255,0.92);
             box-shadow:0 4px 14px rgba(0,60,50,0.45); }
         #dock-toggle.open { background:linear-gradient(150deg,#ffd76a,#e6a900); color:#0d3b33; }
@@ -158,16 +158,16 @@
         body.tools-open #scatter-toggle,
         body.tools-open #tpool-toggle { display:flex; opacity:1; transform:scale(1); }
 
-        #light-toggle     { top:58px;  }
-        #archive-toggle   { top:98px;  }
-        #corner-toggle    { top:138px; background:#e08a2e; }
-        #snap-toggle      { top:178px; background:#12a08a; }
-        #scatter-toggle   { top:218px; background:#7f5bd6; }
-        #tpool-toggle     { top:258px; background:#2f86c9; }
+        #light-toggle     { top:104px;  }
+        #archive-toggle   { top:144px;  }
+        #corner-toggle    { top:184px; background:#e08a2e; }
+        #snap-toggle      { top:224px; background:#12a08a; }
+        #scatter-toggle   { top:264px; background:#7f5bd6; }
+        #tpool-toggle     { top:304px; background:#2f86c9; }
         /* ★ 旧「树池」按钮与面板彻底停用（改用画池 + 底部数字输入） */
         #tree-pool-toggle, body.tools-open #tree-pool-toggle,
         #tree-pool-panel { display:none !important; }
-        #guide-toggle { position:fixed; left:11px; top:298px; z-index:155; width:36px; height:36px; font-size:10px;
+        #guide-toggle { position:fixed; left:11px; top:344px; z-index:155; width:36px; height:36px; font-size:10px;
             display:none; opacity:0; transform:scale(.55); transition:opacity .16s ease, transform .16s ease;
             background:#0f8f7a; border:2px solid rgba(255,255,255,.88); box-shadow:0 3px 9px rgba(0,0,0,.38); }
         body.tools-open #guide-toggle { display:flex; opacity:1; transform:scale(1); }
@@ -178,9 +178,9 @@
         #snap-toggle.on, #tpool-toggle.on { background:#e05b4b; border-color:#ffd76a; }
         #scatter-toggle.armed { background:#27ae60; }
 
-        #light-panel     { left:56px !important; top:58px  !important; }
-        #archive-panel   { left:56px !important; top:98px  !important; }
-        #scatter-panel   { left:56px !important; right:auto !important; top:120px !important; }
+        #light-panel     { left:56px !important; top:104px  !important; }
+        #archive-panel   { left:56px !important; top:144px  !important; }
+        #scatter-panel   { left:56px !important; right:auto !important; top:166px !important; }
 
         body.ui-hidden #dock-toggle,
         body.ui-hidden #light-toggle, body.ui-hidden #tree-pool-toggle, body.ui-hidden #archive-toggle,
@@ -188,7 +188,7 @@
         body.ui-hidden #tpool-toggle { display:none !important; }
 
         /* ===== 顶栏合并成一行，画布上移 60px ===== */
-        .top-bar { padding:10px 58px 2px 58px; flex-direction:row; flex-wrap:wrap;
+        .top-bar { padding:56px 58px 2px 58px; flex-direction:row; flex-wrap:wrap;
             align-items:center; justify-content:center; gap:6px; }
         #hint { display:none !important; }
         .mode-switch { background:rgba(6,42,38,0.58); backdrop-filter:blur(10px);
@@ -200,7 +200,7 @@
 
         /* ===== 右侧控制条：垂直居中，不与任何按钮打架 ===== */
         #side-controls { top:50%; right:8px; gap:6px; max-height:70vh; }
-        #btn-eye-toggle { width:42px; height:42px; top:8px; right:8px;
+        #btn-eye-toggle { width:42px; height:42px; top:54px; right:8px;
             background:rgba(6,42,38,0.6); border:2px solid rgba(95,211,180,0.85); }
 
         /* ===== 底部：更轻更透 ===== */
@@ -1070,12 +1070,15 @@ function getCloudModel(cloudId, onSuccess) {
         cloudModelCache[asset.id] = group;
         try { CLOUD_PROTOS.add(group); } catch (e) {}       // ★ 标记为"缓存原型"，永不算场景内容
         toast.style.display = 'none';
+        /* ★ 2026.9.1 修复：预编译改在"独立离屏场景"里做，缓存原型永远不进主场景 → 不可能再变幽灵分身 */
         try {
-            const oldPos = group.position.clone();
-            group.position.set(0, -10000, 0);
-            scene.add(group);
-            if (renderer.compile) renderer.compile(scene, camera);
-            group.position.copy(oldPos);
+            if (!window._warmScene) {
+                window._warmScene = new THREE.Scene();
+                window._warmScene.add(new THREE.AmbientLight(0xffffff, 1.2));
+                window._warmScene.add(new THREE.DirectionalLight(0xffffff, 1.0));
+            }
+            window._warmScene.add(group);
+            if (renderer && renderer.compile) renderer.compile(window._warmScene, camera);
         } catch (e) {}
         try { if (group.parent) group.parent.remove(group); } catch (e) {}   // ★ 无论编译是否报错，都必须摘掉
         const cbs = loadingLocks[cloudId] || [];
@@ -3712,6 +3715,7 @@ function applyRandomVariation(obj, type, isPlant) {
 }
 
 function createObject(type, pos) {
+    if (!allowPlace(type, pos)) return;   // ★ 2026.9.1 一次点击只准生成一个（挡住双事件/重复回调）
     if (type.startsWith('cloud_')) {
         getCloudModel(type, (model) => {
             model.userData.isModel = true;
@@ -3858,42 +3862,71 @@ function forceOpenInChrome(url) {
     else if (isIOS) window.location.href = `googlechrome://${urlWithoutProtocol}`;
     else window.open(url, '_blank');
 }
-/* ====== ★ 2026.8.26 新增：清除 / 接管"删不掉的残留幽灵模型" ★ ====== */
-const CLOUD_PROTOS = new Set();                 // 云模型"缓存原型"集合
+/* ====== ★ 2026.9.1 重写：幽灵深度清理 + 精准点选 + 放置防重（彻底治好"多出一个人/删不掉/清不掉"）★ ====== */
+const CLOUD_PROTOS = new Set();                        // 云模型"缓存原型"集合：永不算场景内容
+const RAW_MESH_RAYCAST = THREE.Mesh.prototype.raycast; // 备份原生射线检测（精准点选时临时借用）
+let gestureOpen = false;                               // 有没有"配对的按下"，防止孤立抬起事件误放模型
+let gestureMulti = false;                              // 本次手势是否用了两指（缩放/旋转）
+
 function isProtoObject(o) {
     if (!o) return false;
     if (CLOUD_PROTOS.has(o)) return true;
     for (const k in cloudModelCache) if (cloudModelCache[k] === o) return true;
     return false;
 }
-/* 系统对象白名单：这些绝对不能动 */
-function isSystemSceneChild(o) {
-    if (!o) return true;
-    if (o.isLight || o.isCamera) return true;
-    if (o === reticleMarker || o === shadowCatcherPlane) return true;
-    if (o === measureGroup || o === rubberGroup || o === tpGroup || o === guideGroup) return true;
-    if (o === currentLine) return true;
-    if (o.isGridHelper || o.type === 'GridHelper') return true;
-    if (fadingLines.indexOf(o) >= 0) return true;
-    for (let i = 0; i < butterflies.length; i++) if (butterflies[i] && butterflies[i].group === o) return true;
-    return false;
+/* 系统对象（含全部子孙）：这些永远不能被当成内容删除 */
+function systemObjectSet() {
+    const set = new Set();
+    const add = (o) => { if (!o) return; try { o.traverse(c => set.add(c)); } catch (e) { set.add(o); } };
+    add(reticleMarker); add(shadowCatcherPlane);
+    add(measureGroup); add(rubberGroup); add(tpGroup); add(guideGroup);
+    add(currentLine);
+    fadingLines.forEach(add);
+    butterflies.forEach(b => { if (b) add(b.group); });
+    if (scene) scene.children.forEach(o => {
+        if (o.isLight || o.isCamera || o.isGridHelper || o.type === 'GridHelper') add(o);
+    });
+    return set;
 }
-/* 找出"在场景里、但没登记在 placedObjects 里"的对象 = 幽灵 */
+function isSystemSceneChild(o) { return !o ? true : systemObjectSet().has(o); }
+/* 子树里是否有"真的看得见的东西"（隐形点选盒 / 选中框不算） */
+function hasVisibleContent(o) {
+    let found = false;
+    o.traverse(c => {
+        if (found || !c.visible) return;
+        if (c.userData && c.userData.isHitbox) return;
+        if (c.name === 'helper') return;
+        if (c.isMesh || c.isPoints || c.isSprite || c.isLine) {
+            if (c.material && c.material.visible === false) return;
+            found = true;
+        }
+    });
+    return found;
+}
+/* ★ 深度扫描整棵场景树：凡"没登记在 placedObjects、又不是系统对象"的内容，一律算幽灵（含嵌套） */
 function collectGhosts() {
     const out = [];
     if (!scene) return out;
-    const kids = scene.children.slice();
-    for (let i = 0; i < kids.length; i++) {
-        const o = kids[i];
-        if (isSystemSceneChild(o)) continue;
-        if (placedObjects.indexOf(o) >= 0) continue;
-        out.push(o);
-    }
+    const keep = new Set();
+    placedObjects.forEach(o => { try { o.traverse(c => keep.add(c)); } catch (e) { keep.add(o); } });
+    const sys = systemObjectSet();
+    const walk = (parent) => {
+        parent.children.slice().forEach(o => {
+            if (keep.has(o) || sys.has(o)) return;   // 合法内容 / 系统对象：整棵跳过
+            if (o.isLight || o.isCamera || o.isGridHelper || o.type === 'GridHelper') return;
+            if (hasVisibleContent(o)) out.push(o);
+            else walk(o);
+        });
+    };
+    walk(scene);
     return out;
 }
+/* ★ 关键：从"真正的父级"摘掉；scene.remove() 摘不掉的（挂在别的父级下）它也能摘掉 */
+function detachObj(o) { try { if (o && o.parent) o.parent.remove(o); } catch (e) {} }
 function killSceneObject(o) {
+    if (!o) return;
     try { pruneSway(o); } catch (e) {}
-    try { if (o.parent) o.parent.remove(o); } catch (e) {}
+    detachObj(o);
     windyGrassClusters = windyGrassClusters.filter(x => x !== o);
     lotusClusters      = lotusClusters.filter(x => x !== o);
     cloudAnimObjects   = cloudAnimObjects.filter(x => x !== o);
@@ -3901,66 +3934,111 @@ function killSceneObject(o) {
     if (selectedObj === o) { selectedObj = null; try { selectObject(null); } catch (e) {} }
     try { if (typeof chatTarget !== 'undefined' && chatTarget === o) closeChatPanel(); } catch (e) {}
 }
-/* 彻底清除所有幽灵（清空按钮、🗑按钮会用） */
 function purgeGhosts(silent) {
-    const g = collectGhosts();
-    g.forEach(o => killSceneObject(o));
-    for (const k in cloudModelCache) {           // 顺手把可能残留的缓存原型摘掉
-        const p = cloudModelCache[k];
-        if (p && p.parent) { try { p.parent.remove(p); } catch (e) {} }
+    let n = 0;
+    for (let pass = 0; pass < 3; pass++) {          // 多扫几遍，嵌套残留也挖得出来
+        const g = collectGhosts();
+        if (!g.length) break;
+        g.forEach(o => { killSceneObject(o); n++; });
     }
-    if (!silent) showSysToast(g.length ? ('🧹 已清除 ' + g.length + ' 个残留模型') : '✅ 场景很干净');
-    return g.length;
+    for (const k in cloudModelCache) { const p = cloudModelCache[k]; if (p && p.parent) detachObj(p); }
+    if (!silent) showSysToast(n ? ('🧹 已清除 ' + n + ' 个残留模型') : '✅ 场景很干净');
+    return n;
 }
-/* 每次手指按下顺手做一次：原型直接摘掉，其它残留收进 placedObjects
-   → 幽灵立刻变成"可点选 / 可长按删除 / 可被清空"的正常模型 */
+/* 收编幽灵：保持世界位置挂回 scene → 立刻可点选 / 可长按删除 / 可被清空 */
+function adoptGhost(o) {
+    try {
+        o.updateMatrixWorld(true);
+        const m = o.matrixWorld.clone();
+        scene.add(o);
+        m.decompose(o.position, o.quaternion, o.scale);
+    } catch (e) { try { scene.add(o); } catch (e2) {} }
+    if (!o.userData) o.userData = {};
+    if (!o.userData.isModel && !o.userData.isPaving) o.userData.isModel = true;
+    o.userData._adopted = true;
+    placedObjects.push(o);
+}
 function sweepGhosts() {
     const g = collectGhosts();
     let n = 0;
-    g.forEach(o => {
-        if (isProtoObject(o)) { try { o.parent.remove(o); } catch (e) {} return; }
-        if (!o.userData) o.userData = {};
-        if (!o.userData.isModel && !o.userData.isPaving) o.userData.isModel = true;
-        o.userData._adopted = true;
-        placedObjects.push(o);
-        n++;
-    });
+    g.forEach(o => { if (isProtoObject(o)) { detachObj(o); return; } adoptGhost(o); n++; });
     return n;
 }
-/* ====== ★ 幽灵清理模块结束 ★ ====== */
+/* ---------- ★ 精准点选：射线真正打到"看得见的模型"就选中它，绝不再往它身上叠新模型 ---------- */
+function _preciseCandidates() {
+    const arr = [];
+    placedObjects.forEach(o => {
+        const ud = o.userData || {};
+        if (!ud.isModel) return;                                   // 铺装/草地/水面 → 仍然可在上面放东西
+        if (ud.isPaving || ud.isScatter) return;                   // 组合种植区 → 仍然可往里补种
+        if (isTreeId(ud.id) || isTreeId(ud.modelId)) return;       // 树 → 树冠下仍然可继续种花
+        arr.push(o);
+    });
+    if (arr.length > 24) {                                         // 手机性能保护：只测最近的 24 个
+        try {
+            const cam = new THREE.Vector3().setFromMatrixPosition(getRayCamera().matrixWorld);
+            arr.sort((a, b) => a.position.distanceToSquared(cam) - b.position.distanceToSquared(cam));
+        } catch (e) {}
+        return arr.slice(0, 24);
+    }
+    return arr;
+}
+function pickPlacedPrecise(clientX, clientY) {
+    const list = _preciseCandidates();
+    if (!list.length) return null;
+    mouse.x = (clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(clientY / window.innerHeight) * 2 + 1;
+    raycaster.setFromCamera(mouse, getRayCamera());
+    const restore = [];
+    list.forEach(o => o.traverse(c => {
+        if (c.isMesh && !(c.userData && c.userData.isHitbox) && c.name !== 'helper' && c.raycast !== RAW_MESH_RAYCAST) {
+            restore.push(c); c.raycast = RAW_MESH_RAYCAST;
+        }
+    }));
+    let hits = [];
+    try { hits = raycaster.intersectObjects(list, true); } catch (e) { hits = []; }
+    restore.forEach(c => { c.raycast = function () {}; });
+    if (!hits.length) return null;
+    let t = hits[0].object;
+    while (t && list.indexOf(t) < 0 && t.parent) t = t.parent;
+    return (t && list.indexOf(t) >= 0) ? t : null;
+}
+/* ---------- ★ 放置防重：一次点击 / 同一位置极短时间内，最多只生成一个模型 ---------- */
+let _placeLast = { t: 0, id: '', x: 1e9, z: 1e9 };
+function allowPlace(id, pos) {
+    const now = Date.now();
+    if (_placeLast.id === id && now - _placeLast.t < 500 &&
+        Math.hypot(pos.x - _placeLast.x, pos.z - _placeLast.z) < 0.20) return false;
+    _placeLast = { t: now, id: id, x: pos.x, z: pos.z };
+    return true;
+}
+/* ====== ★ 幽灵清理 + 精准点选 模块结束 ★ ====== */
 function doUndo() {
-    if (currentMode === 'path' && pathPoints.length > 0) { pathPoints.pop(); updatePreviewLine();
-    } 
+    if (currentMode === 'path' && pathPoints.length > 0) { pathPoints.pop(); updatePreviewLine(); }
     else if (placedObjects.length > 0) {
-        const lastObj = placedObjects.pop();
-        pruneSway(lastObj);
-        scene.remove(lastObj);
-        windyGrassClusters = windyGrassClusters.filter(o => o !== lastObj); 
-        lotusClusters = lotusClusters.filter(o => o !== lastObj);
-        cloudAnimObjects = cloudAnimObjects.filter(o => o !== lastObj);
-        if (selectedObj === lastObj) selectObject(null);
+        killSceneObject(placedObjects[placedObjects.length - 1]);   // ★ 统一走"彻底摘除"
     }
 }
 
 function doClear() {
-    placedObjects.forEach(o => { try { pruneSway(o); } catch (e) {} scene.remove(o); });
+    placedObjects.slice().forEach(o => { try { pruneSway(o); } catch (e) {} detachObj(o); });
     placedObjects = []; windyGrassClusters = []; lotusClusters = [];
     cloudAnimObjects = []; swayObjects = [];
-    if(currentLine) scene.remove(currentLine); pathPoints = []; selectObject(null);
-    purgeGhosts(true);                     // ★ 连"删不掉的残留模型"一起铲平
-    document.getElementById('stat-area-box').style.display = 'none'; 
+    if (currentLine) {
+        detachObj(currentLine);
+        try { if (currentLine.geometry) currentLine.geometry.dispose(); } catch (e) {}
+        currentLine = null;
+    }
+    pathPoints = []; selectObject(null);
+    purgeGhosts(true);                     // ★ 深度铲平：连挂在别的父级下的残留也一起清掉
+    try { if (chatTarget && !chatTarget.parent) closeChatPanel(); } catch (e) {}
+    document.getElementById('stat-area-box').style.display = 'none';
     document.getElementById('val-len').innerText = '0';
 }
 
 function doDeleteSelected() {
-    if(selectedObj) { 
-        pruneSway(selectedObj);
-        scene.remove(selectedObj);
-        placedObjects = placedObjects.filter(o => o !== selectedObj); 
-        windyGrassClusters = windyGrassClusters.filter(o => o !== selectedObj);
-        lotusClusters = lotusClusters.filter(o => o !== selectedObj);
-        cloudAnimObjects = cloudAnimObjects.filter(o => o !== selectedObj);
-        selectObject(null); 
+    if (selectedObj) {
+        killSceneObject(selectedObj);
         showSysToast('已删除选中模型');
     } else {
         const n = purgeGhosts(true);
@@ -4480,6 +4558,8 @@ function setupInteractions() {
 
     const handleInteractStart = (clientX, clientY, touchesLength) => {
         hitExistingObject = false;
+        gestureOpen = true;                          // ★ 2026.9.1 标记"这次抬起是合法的"
+        gestureMulti = (touchesLength >= 2);         // ★ 两指手势结束时不许放模型
         try { sweepGhosts(); } catch (e) {}      // ★ 残留模型立刻变成可点选/可删除
         hideFloatPanels();
         touchStartPos.set(clientX, clientY);
@@ -4491,6 +4571,13 @@ function setupInteractions() {
             raycaster.setFromCamera(mouse, getRayCamera());
             const intersects = raycaster.intersectObjects(placedObjects, true);
             let result = findInteractTarget(intersects);
+            /* ★ 2026.9.1 精准补测：隐形点选盒没打中时，用"真实网格轮廓"再测一次（仅景观摆放模式）
+               → 点在人物裙摆/袖子/亭子/石头上一定是"选中"，绝不会在它身上再叠一个分身
+               （树、组合种植区、铺装草地全部排除在外，树冠下种花、面上补种完全不受影响） */
+            if (!result && currentMode === 'object') {
+                const pm = pickPlacedPrecise(clientX, clientY);
+                if (pm) result = { target: pm, hit: null, isModel: true };
+            }
             /* ★ 2026.8.24 精准点选：删除原来"离已选模型 0.45m 内自动命中"的模糊判定。
                现在必须射线真正打中模型本体，才会选中它；点空白/地面就是放置或取消选中。 */
             if (scatterArmed && result && result.target.userData.isPaving) {
@@ -4573,6 +4660,11 @@ function setupInteractions() {
         const _gFired = guideDelFired;
         guidePressCancel();
         const moveDist = touchStartPos.distanceTo(new THREE.Vector2(clientX, clientY));
+        /* ★ 2026.9.1：没有配对的"按下"就直接忽略这次"抬起"
+           （套壳App会把 touch 和 mouse 事件各补发一遍，这正是"点一下冒两个人"的元凶之一） */
+        if (!gestureOpen) { isDraggingModel = false; return; }
+        gestureOpen = false;
+        if (gestureMulti) { gestureMulti = false; isDraggingModel = false; return; }  // 两指缩放/旋转结束，不放模型
         if (_gFired) { isDraggingModel = false; return; }
         /* ★★ 新增：轻点「人物类模型」→ 打开对话面板
            · 长按（isLongPressActive）仍然是原来的删除模型，不受影响
@@ -4596,7 +4688,15 @@ function setupInteractions() {
 
             if (currentMode === 'object' && pt) {
                 // 点在已有模型上 → 只选中它；点在空白/铺装上 → 才放置新模型
-                if (!hitExistingObject) createObject(currentAsset.id, pt);
+                if (!hitExistingObject) {
+                    /* ★ 2026.9.1 二次确认：万一按下阶段状态丢失，这里再精准测一次，绝不在模型身上叠放 */
+                    const pm = pickPlacedPrecise(clientX, clientY);
+                    if (pm) {
+                        hitExistingObject = true;
+                        selectObject(pm);
+                        if (isCharacterObject(pm)) openChatPanel(pm);
+                    } else createObject(currentAsset.id, pt);
+                }
             }
             else if (currentMode === 'path') {
                 raycaster.setFromCamera(mouse, getRayCamera());
@@ -7718,8 +7818,10 @@ function ensureVCUI() {
     const fab = document.createElement('button');
     fab.id = 'vc-fab'; fab.innerText = '🙈'; fab.title = '隐藏通话条';
     document.body.appendChild(fab);
-    fab.addEventListener('pointerdown', e => e.stopPropagation());
-    fab.addEventListener('touchstart', e => e.stopPropagation());
+    /* ★ 2026.9.1：补齐全部事件拦截，避免点悬浮球时"只有抬起没有按下"被当成点地面放模型 */
+    ['pointerdown','pointerup','pointermove','touchstart','touchmove','touchend',
+     'mousedown','mousemove','mouseup','click']
+        .forEach(t => fab.addEventListener(t, e => e.stopPropagation()));
     fab.onclick = (e) => { e.stopPropagation(); vcBarHide(!document.body.classList.contains('vcx')); };
 
     const row = document.createElement('div');
