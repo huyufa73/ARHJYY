@@ -140,7 +140,7 @@
         body.ui-hidden #btn-eye-toggle { display: flex !important; }
 
         /* ===== 青山绿水 · 极简工具坞（画布最大化） ===== */
-        #dock-toggle { position:fixed; left:8px; top:8px; z-index:160; width:42px; height:42px; font-size:18px;
+        #dock-toggle { position:fixed; left:8px; top:54px; z-index:160; width:42px; height:42px; font-size:18px;
             background:linear-gradient(150deg,#5fd3b4,#2e9c8a); border:2px solid rgba(255,255,255,0.92);
             box-shadow:0 4px 14px rgba(0,60,50,0.45); }
         #dock-toggle.open { background:linear-gradient(150deg,#ffd76a,#e6a900); color:#0d3b33; }
@@ -158,16 +158,16 @@
         body.tools-open #scatter-toggle,
         body.tools-open #tpool-toggle { display:flex; opacity:1; transform:scale(1); }
 
-        #light-toggle     { top:58px;  }
-        #archive-toggle   { top:98px;  }
-        #corner-toggle    { top:138px; background:#e08a2e; }
-        #snap-toggle      { top:178px; background:#12a08a; }
-        #scatter-toggle   { top:218px; background:#7f5bd6; }
-        #tpool-toggle     { top:258px; background:#2f86c9; }
+        #light-toggle     { top:104px;  }
+        #archive-toggle   { top:144px;  }
+        #corner-toggle    { top:184px; background:#e08a2e; }
+        #snap-toggle      { top:224px; background:#12a08a; }
+        #scatter-toggle   { top:264px; background:#7f5bd6; }
+        #tpool-toggle     { top:304px; background:#2f86c9; }
         /* ★ 旧「树池」按钮与面板彻底停用（改用画池 + 底部数字输入） */
         #tree-pool-toggle, body.tools-open #tree-pool-toggle,
         #tree-pool-panel { display:none !important; }
-        #guide-toggle { position:fixed; left:11px; top:298px; z-index:155; width:36px; height:36px; font-size:10px;
+        #guide-toggle { position:fixed; left:11px; top:344px; z-index:155; width:36px; height:36px; font-size:10px;
             display:none; opacity:0; transform:scale(.55); transition:opacity .16s ease, transform .16s ease;
             background:#0f8f7a; border:2px solid rgba(255,255,255,.88); box-shadow:0 3px 9px rgba(0,0,0,.38); }
         body.tools-open #guide-toggle { display:flex; opacity:1; transform:scale(1); }
@@ -178,9 +178,9 @@
         #snap-toggle.on, #tpool-toggle.on { background:#e05b4b; border-color:#ffd76a; }
         #scatter-toggle.armed { background:#27ae60; }
 
-        #light-panel     { left:56px !important; top:58px  !important; }
-        #archive-panel   { left:56px !important; top:98px  !important; }
-        #scatter-panel   { left:56px !important; right:auto !important; top:120px !important; }
+        #light-panel     { left:56px !important; top:104px  !important; }
+        #archive-panel   { left:56px !important; top:144px  !important; }
+        #scatter-panel   { left:56px !important; right:auto !important; top:166px !important; }
 
         body.ui-hidden #dock-toggle,
         body.ui-hidden #light-toggle, body.ui-hidden #tree-pool-toggle, body.ui-hidden #archive-toggle,
@@ -188,7 +188,7 @@
         body.ui-hidden #tpool-toggle { display:none !important; }
 
         /* ===== 顶栏合并成一行，画布上移 60px ===== */
-        .top-bar { padding:10px 58px 2px 58px; flex-direction:row; flex-wrap:wrap;
+        .top-bar { padding:56px 58px 2px 58px; flex-direction:row; flex-wrap:wrap;
             align-items:center; justify-content:center; gap:6px; }
         #hint { display:none !important; }
         .mode-switch { background:rgba(6,42,38,0.58); backdrop-filter:blur(10px);
@@ -200,7 +200,7 @@
 
         /* ===== 右侧控制条：垂直居中，不与任何按钮打架 ===== */
         #side-controls { top:50%; right:8px; gap:6px; max-height:70vh; }
-        #btn-eye-toggle { width:42px; height:42px; top:8px; right:8px;
+        #btn-eye-toggle { width:42px; height:42px; top:54px; right:8px;
             background:rgba(6,42,38,0.6); border:2px solid rgba(95,211,180,0.85); }
 
         /* ===== 底部：更轻更透 ===== */
@@ -2404,7 +2404,19 @@ async function resumeAR() {
     }
 }
 async function initAR() {
-    renderer = new THREE.WebGLRenderer({ antialias: false, alpha: true, powerPreference: 'high-performance' });
+    // ★修复①：AR开启时 makeXRCompatible 可能静默切换WebGL上下文，导致人物贴图丢失/发白
+    //   —— 建渲染器时就让上下文成为 XR 兼容，从根源杜绝上下文切换丢纹理
+    let _xrCanvas = document.createElement('canvas');
+    let _xrGL = null;
+    const _xrAttr = { alpha: true, antialias: false, depth: true, stencil: false,
+                      premultipliedAlpha: true, preserveDrawingBuffer: false,
+                      powerPreference: 'high-performance', xrCompatible: true };
+    try { _xrGL = _xrCanvas.getContext('webgl2', _xrAttr) || _xrCanvas.getContext('webgl', _xrAttr); } catch (e) { _xrGL = null; }
+    if (_xrGL) {
+        renderer = new THREE.WebGLRenderer({ canvas: _xrCanvas, context: _xrGL, antialias: false, alpha: true, powerPreference: 'high-performance' });
+    } else {
+        renderer = new THREE.WebGLRenderer({ antialias: false, alpha: true, powerPreference: 'high-performance' });
+    }
     renderer.setPixelRatio(1.0);
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.xr.enabled = true;
@@ -3711,9 +3723,32 @@ function applyRandomVariation(obj, type, isPlant) {
     return { rx, rz };
 }
 
+/* ★修复②：判断人物 + 销毁场景中已存在的人物（保证场景只留1个人物） */
+function _isPersonType(type) {
+    const m = CLOUD_MODELS.find(a => a.id === type);
+    return !!(m && m.cat === 'cat_renwu');
+}
+function _removeExistingPersons() {
+    const persons = placedObjects.filter(o => isCharacterObject(o));
+    persons.forEach(o => { try { killSceneObject(o); } catch (e) { try { scene.remove(o); } catch (e2) {} } });
+}
+/* ★修复①(兜底)：把人物贴图强制重新上传到当前GPU上下文，杜绝AR下发白/斑驳 */
+function _reuploadTextures(root) {
+    if (!root) return;
+    const KEYS = ['map','emissiveMap','normalMap','roughnessMap','metalnessMap','aoMap','bumpMap','alphaMap','specularMap','lightMap'];
+    root.traverse(c => {
+        if (!c.isMesh || !c.material) return;
+        const mats = Array.isArray(c.material) ? c.material : [c.material];
+        mats.forEach(m => { if (!m) return; KEYS.forEach(k => { if (m[k]) m[k].needsUpdate = true; }); m.needsUpdate = true; });
+    });
+}
+
 function createObject(type, pos) {
     if (type.startsWith('cloud_')) {
+        const _person = _isPersonType(type);
+        if (_person) _removeExistingPersons();   // ★放置前先销毁旧人物，场景永远只保留1个
         getCloudModel(type, (model) => {
+            if (_person) _removeExistingPersons();   // ★防止异步加载期间连点，二次清理旧人物
             model.userData.isModel = true;
             model.userData.id = type;
             const assetDef = CLOUD_MODELS.find(a => a.id === type);
@@ -3731,6 +3766,7 @@ function createObject(type, pos) {
             model.position.set(pos.x, pos.y || groundLevel, pos.z);
             scene.add(model);
             placedObjects.push(model);
+            if (_person) _reuploadTextures(model);   // ★人物放置后强制重传贴图，修复AR贴图丢失
             selectObject(model);
             /* ★首次AR放置人物 → 自动接通并做一次轻松自介（本地打标，后续不再触发） */
             if (assetDef && assetDef.cat === 'cat_renwu' && !introDone()) {
