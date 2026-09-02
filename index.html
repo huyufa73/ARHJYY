@@ -449,6 +449,7 @@
 
 <script type="module">
 import * as THREE from 'three';
+window.THREE = THREE;   // HJFIX 需要，用于幻影去重与强制清除
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
@@ -2332,7 +2333,7 @@ async function createARSession() {
             domOverlay: { root: document.body }
         });
     }
-    return session;
+    return session;document.querySelector('#你的UI容器id').addEventListener('beforexrselect', e => e.preventDefault());
 }
 let resumeFrames = 0;
 function handleSessionEnded() {
@@ -6899,7 +6900,7 @@ async function vadStart() {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return false;
     try {
         VAD.stream = await navigator.mediaDevices.getUserMedia({
-            audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true, channelCount:1 }
+            audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 }
         });
         const AC = window.AudioContext || window.webkitAudioContext;
         VAD.ac = new AC();
@@ -7122,7 +7123,7 @@ async function recStart() {
         recObj = new SR_CLS();
         recObj.lang = 'zh-CN';
         recObj.continuous = true;
-        recObj.interimResults = true;
+        recObj.interimResults = false;
         try { recObj.maxAlternatives = 3; } catch (e) {}
         recObj.onresult = (e) => {
             let interim = '', fin = '';
@@ -8001,7 +8002,517 @@ async function sendChat(text, hidden) {
 /* ====================== 3D 人物语音通话模块 v2 结束 ====================== */
 initAR();
 </script>
+<!-- ================== 幻境 Pro 修复补丁 HJFIX v1.0 ==================
+  A. 修复：点人物交流/打断时凭空多出一个模型、且清空/撤销都删不掉
+  B. 修复：AI 把环境杂音和自己的TTS当成用户说话，抢话、自言自语
+  用法：放在 </body> 之前（必须在你所有其它 <script> 之后）
+  调试：控制台输入  window.__HJ_DEBUG = true   即可看到每一次拦截原因
+================================================================== -->
+<script>
+(function(){
+'use strict';
+if (window.__HJFIX) return; window.__HJFIX = true;
 
+var T0 = performance.now();
+var now = function(){ return performance.now(); };
+var D   = function(){ if(window.__HJ_DEBUG){ try{ console.log.apply(console,['[HJFIX]'].concat([].slice.call(arguments))); }catch(e){} } };
+
+var G = {
+  scene:null, camera:null, refSpace:null,
+  suppressUntil:0,      // 在此时刻之前，禁止 XR select 触发放置
+  lastSelectRun:0,      // 上一次真正放行的 select
+  chatUntil:0,          // 最近一次"开始对话/朗读"的时间窗
+  snap:null,            // select 之前的场景快照
+  addLog:[],            // 最近被 add 进场景的节点
+  phantom:0             // 累计清掉的幻影数
+};
+window.HJ = window.HJ || {};
+
+/* ==========================================================
+   A-1  DOM 覆盖层吞掉 XR select（Bug A 的第一根因）
+   ========================================================== */
+var UI_SEL = 'button,input,select,textarea,label,a,[role="button"],[onclick],' +
+             '.btn,.button,.panel,.toolbar,.bar,.sheet,.dialog,.modal,.menu,' +
+             '.item,.card,.thumb,.chip,.tab,.switch,.slider,.list,.tool,.icon';
+
+function arm(el){
+  try{
+    if(!el || el.__hjArmed) return;
+    el.__hjArmed = true;
+    el.addEventListener('beforexrselect', function(ev){ ev.preventDefault(); }, false);
+  }catch(e){}
+}
+function armAll(){
+  try{
+    // 最外层容器（overlay root）优先，事件会冒泡，一次就能保护整片 UI
+    ['#overlay','#ui','#uiRoot','#ui-root','#dom-overlay','#domOverlay','#hud','#app','#root','.overlay','.ui']
+      .forEach(function(s){ document.querySelectorAll(s).forEach(arm); });
+    document.querySelectorAll(UI_SEL).forEach(arm);
+  }catch(e){}
+}
+armAll();
+try{ new MutationObserver(armAll).observe(document.documentElement,{childList:true,subtree:true}); }catch(e){}
+
+// 你如果是用  起的 session，这里自动给 root 装上保护
+try{
+  if(navigator.xr && navigator.xr.requestSession){
+    var _rs = navigator.xr.requestSession.bind(navigator.xr);
+    navigator.xr.requestSession = function(mode, init){
+      try{ if(init && init. && init.domOverlay.root){ arm(init.domOverlay.root); D('已保护 domOverlay.root'); } }catch(e){}
+      return _rs(mode, init);
+    };
+  }
+}catch(e){}
+
+// 任何落在 UI 上的触摸，700ms 内禁止放置（双保险，覆盖不支持 beforexrselect 的内核）
+['pointerdown','touchstart','mousedown'].forEach(function(t){
+  window.addEventListener(t, function(e){
+    try{
+      var el = e.target;
+      var onUI = !!(el && el.closest && el.closest(UI_SEL));
+      if(onUI){ G.suppressUntil = Math.max(G.suppressUntil, now()+700); D('UI点击 → 屏蔽放置 700ms'); }
+    }catch(err){}
+  }, true);
+});
+
+/* ==========================================================
+   A-2  接管 THREE：拿到 scene/camera，并记录所有被 add 的节点
+   ========================================================== */
+function isSystemNode(o){
+  if(!o) return true;
+  if(o.isLight || o.isCamera || o.isScene) return true;
+  var n = (o.name||'') + '|' + (o.type||'');
+  if(/reticle|cursor|光标|准星|helper|grid|axes|sky|env|controller|hand|shadow|line?segments/i.test(n)) return true;
+  if(o.userData && o.userData.hjKeep) return true;
+  return false;
+}
+function descCount(o){ var c=0; try{ o.traverse(function(){c++;}); }catch(e){} return c; }
+function keyOf(o){ return (o.name||o.type||'?') + '#' + descCount(o); }
+function wpos(o){
+  try{ var v = new window.THREE.Vector3(); o.getWorldPosition(v); if(isFinite(v.x)) return v; }catch(e){}
+  try{ return o.position.clone(); }catch(e){ return null; }
+}
+function noteAdd(o){
+  try{
+    if(!o || !o.isObject3D || isSystemNode(o)) return;
+    o.userData = o.userData || {};
+    if(!o.userData.__hjPlaced) o.userData.__hjPlaced = now();
+    G.addLog.push({ o:o, t:now(), k:keyOf(o) });
+    if(G.addLog.length>400) G.addLog.splice(0,200);
+    clearTimeout(noteAdd._t);
+    noteAdd._t = setTimeout(dedupeRecent, 380);
+  }catch(e){}
+}
+// 极近距离同款重复（一次点击被放置了两遍）
+function dedupeRecent(){
+  try{
+    var THREEL = window.THREE; if(!THREEL) return;
+    var t = now(), recent = G.addLog.filter(function(r){ return t - r.t < 500 && r.o && r.o.parent; });
+    if(recent.length===0) return;
+    if(recent.length>=3){ D('批量种植('+recent.length+')，跳过去重'); return; } // 组合种植不能误删
+    for(var i=0;i<recent.length;i++){
+      for(var j=i+1;j<recent.length;j++){
+        var a=recent[i].o, b=recent[j].o;
+        if(!a.parent||!b.parent) continue;
+        if(a.userData.hjNoDedupe||b.userData.hjNoDedupe) continue;
+        if(recent[i].k!==recent[j].k) continue;
+        var pa=wpos(a), pb=wpos(b); if(!pa||!pb) continue;
+        if(pa.distanceTo(pb) < 0.06){                 // 6cm 内的同款 = 重复放置
+          var late = (recent[i].t>=recent[j].t)? a : b;
+          killNode(late, '同一次点击重复放置');
+        }
+      }
+    }
+  }catch(e){}
+}
+function hookTHREE(){
+  try{
+    var THREEL = window.THREE;
+    if(!THREEL || !THREEL.Object3D) return false;
+    if(!THREEL.Object3D.prototype.__hjAdd){
+      THREEL.Object3D.prototype.__hjAdd = true;
+      var _add = THREEL.Object3D.prototype.add;
+      THREEL.Object3D.prototype.add = function(){
+        var r = _add.apply(this, arguments);
+        for(var i=0;i<arguments.length;i++) noteAdd(arguments[i]);
+        return r;
+      };
+      D('已挂钩 Object3D.add');
+    }
+    if(THREEL.WebGLRenderer && !THREEL.WebGLRenderer.prototype.__hjR){
+      THREEL.WebGLRenderer.prototype.__hjR = true;
+      var _render = THREEL.WebGLRenderer.prototype.render;
+      THREEL.WebGLRenderer.prototype.render = function(scene, camera){
+        if(scene) G.scene = scene; if(camera) G.camera = camera;
+        return _render.apply(this, arguments);
+      };
+      D('已挂钩 WebGLRenderer.render');
+    }
+    return true;
+  }catch(e){ return false; }
+}
+hookTHREE();
+var hookTimer = setInterval(function(){
+  if(hookTHREE() && G.scene) clearInterval(hookTimer);
+  if(now()-T0 > 60000) clearInterval(hookTimer);
+}, 200);
+
+/* ==========================================================
+   A-3  彻底删除（解决"怎么也清除不了"）
+   ========================================================== */
+function disposeDeep(o){
+  try{
+    o.traverse(function(c){
+      if(c.geometry && c.geometry.dispose) c.geometry.dispose();
+      var m = c.material;
+      if(m){ (Array.isArray(m)?m:[m]).forEach(function(mm){
+        try{ for(var k in mm){ var v=mm[k]; if(v && v.isTexture && v.dispose) v.dispose(); } }catch(e){}
+        if(mm.dispose) mm.dispose();
+      }); }
+    });
+  }catch(e){}
+}
+function killNode(o, why){
+  try{
+    if(!o) return false;
+    if(o.parent) o.parent.remove(o);
+    disposeDeep(o);
+    o.visible = false;
+    G.phantom++;
+    D('已删除幻影：', why, o.name||o.type);
+    return true;
+  }catch(e){ return false; }
+}
+function collectPlaced(root, out){
+  if(!root) return out;
+  try{
+    root.children.slice().forEach(function(c){
+      if(c.userData && c.userData.__hjPlaced) out.push(c);
+      else collectPlaced(c, out);   // 幻影常被塞进别的模型/相机的子节点里
+    });
+  }catch(e){}
+  return out;
+}
+HJ.list = function(){
+  var a = collectPlaced(G.scene,[]).concat(collectPlaced(G.camera,[]));
+  console.log('[HJFIX] 场景内被记录的模型数：', a.length, a.map(function(o){return o.name||o.type;}));
+  return a;
+};
+HJ.purgePhantoms = function(){
+  var n=0, a = collectPlaced(G.scene,[]).concat(collectPlaced(G.camera,[]));
+  a.forEach(function(o){ if(o.userData.__hjPhantom){ if(killNode(o,'手动清幻影')) n++; } });
+  D('清掉幻影 '+n+' 个'); return n;
+};
+HJ.purgeAll = function(){
+  var n=0, a = collectPlaced(G.scene,[]).concat(collectPlaced(G.camera,[]));
+  a.forEach(function(o){ if(killNode(o,'强制全清')) n++; });
+  D('强制清掉 '+n+' 个'); return n;
+};
+// 长按"清空"1.2 秒 = 强制全清（带确认，防误触）
+try{
+  document.addEventListener('pointerdown', function(e){
+    var el = e.target && e.target.closest && e.target.closest('button,div,span,a');
+    if(!el) return;
+    var txt = (el.innerText||el.textContent||'').trim();
+    if(!/清空|删除选中|清除/.test(txt) || txt.length>8) return;
+    el.__hjLP = setTimeout(function(){
+      if(confirm('【长按强制清除】\n将移除场景中全部已放置模型（含删不掉的幻影），确定吗？')) HJ.purgeAll();
+    }, 1200);
+  }, true);
+  ['pointerup','pointercancel','pointerleave'].forEach(function(t){
+    document.addEventListener(t, function(e){
+      var el = e.target && e.target.closest && e.target.closest('button,div,span,a');
+      if(el && el.__hjLP){ clearTimeout(el.__hjLP); el.__hjLP=null; }
+    }, true);
+  });
+}catch(e){}
+
+/* ==========================================================
+   A-4  XR select 闸门：点到已有模型 / 正在对话 → 事后清掉新增幻影
+   ========================================================== */
+try{
+  if(window.XRSession){
+    var _rrs = XRSession.prototype.requestReferenceSpace;
+    XRSession.prototype.requestReferenceSpace = function(type){
+      var p = _rrs.apply(this, arguments);
+      try{ p.then(function(rs){ if(type!=='viewer' && !G.refSpace){ G.refSpace = rs; D('已捕获 refSpace:'+type); } }); }catch(e){}
+      return p;
+    };
+  }
+}catch(e){}
+
+function isPlacedChain(o){
+  var p=o;
+  while(p){ if(p.userData && p.userData.__hjPlaced) return p; p=p.parent; }
+  return null;
+}
+function rayHitPlaced(ev){
+  try{
+    var THREEL = window.THREE;
+    if(!THREEL || !G.scene || !G.refSpace || !ev.frame || !ev.inputSource) return null;
+    var pose = ev.frame.getPose(ev.inputSource.targetRaySpace, G.refSpace);
+    if(!pose) return null;
+    var m = new THREEL.Matrix4().fromArray(pose.transform.matrix);
+    var o = new THREEL.Vector3().setFromMatrixPosition(m);
+    var d = new THREEL.Vector3(0,0,-1).transformDirection(m).normalize();
+    var rc = new THREEL.Raycaster(o, d, 0.02, 12);
+    var hits = rc.intersectObjects(G.scene.children, true) || [];
+    for(var i=0;i<hits.length;i++){
+      var owner = isPlacedChain(hits[i].object);
+      if(owner) return owner;
+    }
+  }catch(e){}
+  return null;
+}
+function snapshot(){
+  var s = new Set();
+  try{ (collectPlaced(G.scene,[]).concat(collectPlaced(G.camera,[]))).forEach(function(o){ s.add(o); }); }catch(e){}
+  return s;
+}
+function cleanNewAfterSelect(before, hardKillAll, why){
+  setTimeout(function(){
+    try{
+      var after = collectPlaced(G.scene,[]).concat(collectPlaced(G.camera,[]));
+      var news  = after.filter(function(o){ return !before.has(o); });
+      if(news.length===0) return;
+      if(hardKillAll){
+        news.forEach(function(o){ o.userData.__hjPhantom=1; killNode(o, why); });
+      }else if(news.length>1){
+        news.slice(1).forEach(function(o){ o.userData.__hjPhantom=1; killNode(o,'一次点击产生多个模型'); });
+      }
+    }catch(e){}
+  }, 700);
+}
+
+try{
+  if(window.XRSession){
+    var _sadd = XRSession.prototype.addEventListener;
+    XRSession.prototype.addEventListener = function(type, fn, opt){
+      if(/^select(start|end)?$/.test(type) && typeof fn === 'function'){
+        var wrapped = function(ev){
+          var t = now();
+          if(t < G.suppressUntil){ D('拦截 '+type+'：来自 UI 点击'); return; }
+          if(type==='select'){
+            if(t - G.lastSelectRun < 420){ D('拦截 select：420ms 内重复'); return; }
+            G.lastSelectRun = t;
+            var hit = rayHitPlaced(ev);
+            var chatting = (t < G.chatUntil) || VOICE.speaking;
+            var before = snapshot();
+            var r = fn.apply(this, arguments);          // 你的原逻辑照常跑（对话仍然能触发）
+            // 事后判定：这一下是"点人物"或"正在对话/打断" → 新增的都是幻影
+            setTimeout(function(){
+              var isChat = hit || chatting || (now() < G.chatUntil);
+              cleanNewAfterSelect(before, !!isChat, hit? '点击了已有模型（对话/打断）' : '对话期间的误放置');
+            }, 0);
+            return r;
+          }
+          return fn.apply(this, arguments);
+        };
+        fn.__hjW = wrapped;
+        return _sadd.call(this, type, wrapped, opt);
+      }
+      return _sadd.apply(this, arguments);
+    };
+    var _srem = XRSession.prototype.removeEventListener;
+    XRSession.prototype.removeEventListener = function(t,f,o){ return _srem.call(this, t, (f&&f.__hjW)||f, o); };
+    ['onselect','onselectstart','onselectend'].forEach(function(p){
+      try{
+        Object.defineProperty(XRSession.prototype, p, {
+          configurable:true,
+          get:function(){ return this['__hj_'+p]||null; },
+          set:function(f){
+            if(this['__hj_'+p]) this.removeEventListener(p.slice(2), this['__hj_'+p]);
+            this['__hj_'+p]=f; if(f) this.addEventListener(p.slice(2), f);
+          }
+        });
+      }catch(e){}
+    });
+    D('已装上 select 闸门');
+  }
+}catch(e){}
+
+/* ==========================================================
+   B  语音闸门：只有"清晰的人声"才算用户说话
+   ========================================================== */
+var VOICE = {
+  speaking:false, ttsEndAt:0, poll:null,
+  TAIL_MS:900,          // TTS 结束后的回声尾巴静默期
+  MIN_CHARS:2,          // 少于 2 个字直接丢
+  MIN_CONF:0.45,        // 有置信度时的下限（安卓常为0，会自动跳过）
+  MIN_RMS:0.030,        // 麦克风能量门限（噪声大就调到 0.045~0.06）
+  MIN_VOICE_MS:260,     // 必须连续有人声 260ms 以上
+  WIN_MS:2600,
+  rms:0, voicedMs:0, lastVoiced:0, vadOK:false, ac:null, an:null, buf:null, stream:null,
+  lastText:'', lastAt:0, insts:[]
+};
+VOICE.NOISE = /^[\s，。、,.!?！？~\-—…]*(嗯+|啊+|呃+|哦+|噢+|喔+|唔+|哈+|嘿+|哎+|呀+|喂+|哼+|额+|欸+|那个|这个|然后|就是|ok|okay|uh+|um+|ah+|oh+|hm+|mm+|yeah|yep|bye|hi|hello|the|a|i|you)[\s，。、,.!?！？~\-—…]*$/i;
+VOICE.HALLU = /(谢谢观看|感谢观看|请?订阅|点赞|字幕由|字幕组|明镜|与点点栏目|MBC|新闻)/;
+
+VOICE.startVAD = function(){
+  if(VOICE.ac || window.HJ_VAD===false) return;
+  try{
+    navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true, noiseSuppression:true, autoGainControl:true, channelCount:1}})
+    .then(function(st){
+      VOICE.stream = st;
+      var AC = window.AudioContext||window.webkitAudioContext; if(!AC) return;
+      VOICE.ac = new AC();
+      var src = VOICE.ac.createMediaStreamSource(st);
+      VOICE.an = VOICE.ac.createAnalyser(); VOICE.an.fftSize = 1024;
+      src.connect(VOICE.an);
+      VOICE.buf = new Uint8Array(VOICE.an.fftSize);
+      VOICE.vadOK = true; D('VAD 已启动');
+      var last = now();
+      (function loop(){
+        if(!VOICE.an) return;
+        try{
+          VOICE.an.getByteTimeDomainData(VOICE.buf);
+          var s=0; for(var i=0;i<VOICE.buf.length;i++){ var v=(VOICE.buf[i]-128)/128; s+=v*v; }
+          var rms = Math.sqrt(s/VOICE.buf.length);
+          VOICE.rms = rms;
+          var dt = now()-last; last = now();
+          var muted = VOICE.speaking || now() < VOICE.ttsEndAt;   // 她在说话时不累计
+          if(rms >= VOICE.MIN_RMS && !muted){ VOICE.voicedMs = Math.min(4000, VOICE.voicedMs+dt); VOICE.lastVoiced = now(); }
+          else if(now()-VOICE.lastVoiced > VOICE.WIN_MS){ VOICE.voicedMs = 0; }
+          if(window.HJ_BARGEIN && muted && rms >= VOICE.MIN_RMS*1.8 && VOICE.voicedMs>400){
+            try{ window.speechSynthesis.cancel(); }catch(e){}
+          }
+        }catch(e){}
+        requestAnimationFrame(loop);
+      })();
+    })['catch'](function(err){ VOICE.vadOK=false; D('VAD 不可用（降级为时长/字数/回声过滤）', err && err.name); });
+  }catch(e){ VOICE.vadOK=false; }
+};
+
+VOICE.pass = function(ev){
+  try{
+    var r = ev.results && ev.results[ev.resultIndex]; if(!r) return false;
+    var alt = r[0] || {}; var txt = (alt.transcript||'').trim();
+    var conf = (typeof alt.confidence==='number') ? alt.confidence : -1;
+
+    if(!r.isFinal && !window.HJ_ALLOW_INTERIM)      return D('丢弃：非最终结果'), false;
+    if(VOICE.speaking)                              return D('丢弃：她正在说话（回声）', txt), false;
+    if(now() < VOICE.ttsEndAt)                      return D('丢弃：TTS 回声尾巴内', txt), false;
+    if(!txt)                                        return D('丢弃：空文本'), false;
+    if(txt.replace(/[\s，。、,.!?！？~\-—…"'"'（）()]/g,'').length < VOICE.MIN_CHARS)
+                                                    return D('丢弃：太短', txt), false;
+    if(!/[\u4e00-\u9fa5a-zA-Z0-9]/.test(txt))       return D('丢弃：无有效字符', txt), false;
+    if(VOICE.NOISE.test(txt))                       return D('丢弃：语气/杂音词', txt), false;
+    if(VOICE.HALLU.test(txt))                       return D('丢弃：ASR 幻听词', txt), false;
+    if(conf >= 0 && conf < VOICE.MIN_CONF)          return D('丢弃：置信度低 '+conf.toFixed(2), txt), false;
+    if(txt === VOICE.lastText && now()-VOICE.lastAt < 1600)
+                                                    return D('丢弃：安卓重复上报', txt), false;
+    if(VOICE.vadOK && VOICE.voicedMs < VOICE.MIN_VOICE_MS)
+                                                    return D('丢弃：没听到持续人声 ('+VOICE.voicedMs|0+'ms, rms='+VOICE.rms.toFixed(3)+')', txt), false;
+
+    VOICE.lastText = txt; VOICE.lastAt = now(); VOICE.voicedMs = 0;
+    G.chatUntil = now()+2500;
+    D('✅ 采纳用户语音：', txt, 'conf='+conf);
+    return true;
+  }catch(e){ return true; }
+};
+
+try{
+  var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if(SR && SR.prototype && !SR.prototype.__hj){
+    SR.prototype.__hj = true;
+    var _radd = SR.prototype.addEventListener;
+    SR.prototype.addEventListener = function(t, f, o){
+      if(t==='result' && typeof f==='function'){
+        var w = function(ev){ if(VOICE.pass(ev)) return f.call(this, ev); };
+        f.__hjW = w; return _radd.call(this, t, w, o);
+      }
+      return _radd.apply(this, arguments);
+    };
+    var _rrem2 = SR.prototype.removeEventListener;
+    SR.prototype.removeEventListener = function(t,f,o){ return _rrem2.call(this,t,(f&&f.__hjW)||f,o); };
+    try{
+      Object.defineProperty(SR.prototype,'onresult',{
+        configurable:true,
+        get:function(){ return this.__hjOR||null; },
+        set:function(f){
+          if(this.__hjOR) this.removeEventListener('result', this.__hjOR);
+          this.__hjOR = f; if(f) this.addEventListener('result', f);
+        }
+      });
+    }catch(e){}
+
+    var _rstart = SR.prototype.start;
+    SR.prototype.start = function(){
+      var self = this;
+      if(VOICE.insts.indexOf(this)<0) VOICE.insts.push(this);
+      if(!window.HJ_ALLOW_INTERIM){ try{ this.interimResults = false; }catch(e){} }  // 安卓重复上报的根源
+      try{ this.maxAlternatives = 1; }catch(e){}
+      VOICE.startVAD();
+      var wait = Math.max(0, VOICE.ttsEndAt - now());
+      if(VOICE.speaking || wait>0){
+        clearTimeout(this.__hjT);
+        this.__hjT = setTimeout(function(){ try{ _rstart.call(self); }catch(e){} }, wait+80);
+        D('延后开麦 '+((wait+80)|0)+'ms（等她说完）');
+        return;
+      }
+      try{ return _rstart.call(this); }catch(e){ D('start 异常（多为重复start，可忽略）', e && e.name); }
+    };
+  }
+}catch(e){}
+
+/* TTS 期间关麦（含云端 TTS 用 <audio> 播放的情况） */
+function ttsBegin(){
+  VOICE.speaking = true; VOICE.ttsEndAt = now()+120000;
+  G.chatUntil = now()+2500;
+  G.suppressUntil = Math.max(G.suppressUntil, now()+400);
+  VOICE.insts.forEach(function(r){ try{ r.__hjResume = true; r.abort(); }catch(e){} });
+  D('🔇 她开始说话 → 关麦');
+}
+function ttsEnd(){
+  if(!VOICE.speaking && now()>VOICE.ttsEndAt) return;
+  VOICE.speaking = false; VOICE.ttsEndAt = now()+VOICE.TAIL_MS; VOICE.voicedMs = 0;
+  setTimeout(function(){
+    VOICE.insts.forEach(function(r){ if(r.__hjResume){ r.__hjResume=false; try{ r.start(); }catch(e){} } });
+    D('🎙 回声尾巴结束 → 恢复听');
+  }, VOICE.TAIL_MS+100);
+}
+try{
+  var ss = window.speechSynthesis;
+  if(ss && ss.speak && !ss.__hj){
+    ss.__hj = true;
+    var _speak = ss.speak.bind(ss);
+    ss.speak = function(u){
+      try{
+        ttsBegin();
+        if(u && u.addEventListener){ u.addEventListener('end', ttsEnd); u.addEventListener('error', ttsEnd); }
+        clearInterval(VOICE.poll);
+        VOICE.poll = setInterval(function(){        // 兜底：部分机型 end 不触发
+          try{ if(!ss.speaking && !ss.pending){ clearInterval(VOICE.poll); ttsEnd(); } }catch(e){}
+        }, 350);
+      }catch(e){}
+      return _speak(u);
+    };
+    var _cancel = ss.cancel.bind(ss);
+    ss.cancel = function(){ try{ clearInterval(VOICE.poll); VOICE.speaking=false; VOICE.ttsEndAt=now()+350; setTimeout(ttsEnd,60); }catch(e){} return _cancel(); };
+  }
+}catch(e){}
+try{
+  var _play = HTMLMediaElement.prototype.play;
+  HTMLMediaElement.prototype.play = function(){
+    try{
+      if(!this.srcObject && !this.muted && !this.__hjHooked){   // 排除摄像头 video
+        this.__hjHooked = true;
+        this.addEventListener('playing', ttsBegin);
+        this.addEventListener('ended',  ttsEnd);
+        this.addEventListener('pause',  ttsEnd);
+      }
+      if(!this.srcObject && !this.muted) ttsBegin();
+    }catch(e){}
+    return _play.apply(this, arguments);
+  };
+}catch(e){}
+
+/* 调参入口 */
+HJ.tune = function(o){ Object.assign(VOICE, o||{}); return VOICE; };
+HJ.status = function(){ return {幻影已清:G.phantom, VAD:VOICE.vadOK, rms:+VOICE.rms.toFixed(3), 人声累计ms:VOICE.voicedMs|0, 她在说话:VOICE.speaking}; };
+console.log('%c[HJFIX v1.0] 已加载：AR幻影拦截 + 语音闸门。调试：window.__HJ_DEBUG=true；查看：HJ.status()、HJ.list()；强清：HJ.purgeAll()','color:#0a0');
+})();
+</script>
 
 </body>
 </html>
