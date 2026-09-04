@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>幻境 -全能版</title>
+    <title>AR幻境- 全能版</title>
     <!-- ★ 必须同一个 CDN、同一个版本：混用 cdnjs(build)+unpkg(addons) 时，
          只要有一个域名超时/被拦，整个 module 就一行都不执行 →「进入幻境」变死按钮。
          jsdelivr 你的模型库已经在用，说明肯定通。 -->
@@ -504,6 +504,11 @@ let sharpAnchor = null;     // 直角模式的起始锚点
 let scatterSel = new Set(); // 组合种植：已勾选的植物 id
 let scatterArmed = false;   // 组合种植：是否处于"点选面"待命
 let placedObjects = [], selectedObj = null;
+/* ★ 2026.9.24 点选优化：
+   justDeselected = 本次点击是"在空白处取消选中"，不再顺手放模型
+   pickedByTap    = 当前选中是"用户手动点中模型"得来的（放置后自动选中的不算）
+   → 连续点地面放模型依旧一点一个，绝不会变成要点两次 */
+let justDeselected = false, pickedByTap = false;
 let fadingLines = []; 
 let groundLevel = 0;
 let groundInitialized = false;
@@ -920,25 +925,25 @@ function optimizeGroupRaycast(group, asset) {
     const isTall = size.y > 1.2 && size.y > Math.max(size.x, size.z) * 1.2;
     const _isTreeCat = !!(asset && asset.cat === 'cat_shumu');
     if (isTall && _isTreeCat) {
-        /* 树：只有树干附近能点中，方便在树冠下继续画线/摆件 */
-        hitH = size.y * 0.35;
-        hitW = Math.max(size.x * 0.42, 0.08);
-        hitD = Math.max(size.z * 0.42, 0.08);
+        /* 树：只有树干附近能点中，方便在树冠下继续画线/摆件（★ 2026.9.24 再收窄） */
+        hitH = size.y * 0.26;
+        hitW = Math.max(size.x * 0.28, 0.05);
+        hitD = Math.max(size.z * 0.28, 0.05);
         hitCenterY = box.min.y + hitH * 0.5;
     } else if (isTall) {
-        /* 人物 / 亭子等高瘦物体：全身高度都能点中，但左右不再外扩 */
-        hitH = size.y * 0.96;
-        hitW = Math.max(size.x * 0.62, 0.10);
-        hitD = Math.max(size.z * 0.62, 0.10);
+        /* 人物 / 亭子等高瘦物体：高度仍好点，但左右明显收窄，避免误点（★ 2026.9.24） */
+        hitH = size.y * 0.88;
+        hitW = Math.max(size.x * 0.42, 0.07);
+        hitD = Math.max(size.z * 0.42, 0.07);
         hitCenterY = box.min.y + hitH * 0.5;
     } else {
-        /* ★ 关键：原来外扩 1.25 倍 + 最小 0.22m → 改成 1:1 贴合真实体积 */
-        hitW = Math.max(size.x, 0.08);
-        hitD = Math.max(size.z, 0.08);
-        hitH = Math.max(size.y, 0.08);
+        /* ★ 2026.9.24：由 1:1 再内缩到 0.72，只有真正点在物体本体上才会选中 */
+        hitW = Math.max(size.x * 0.72, 0.05);
+        hitD = Math.max(size.z * 0.72, 0.05);
+        hitH = Math.max(size.y * 0.82, 0.05);
         hitCenterY = box.min.y + hitH * 0.5;
     }
-    const hitGeo = new THREE.BoxGeometry(Math.max(hitW, 0.05), Math.max(hitH, 0.05), Math.max(hitD, 0.05));
+    const hitGeo = new THREE.BoxGeometry(Math.max(hitW, 0.035), Math.max(hitH, 0.035), Math.max(hitD, 0.035));
     const hitMat = new THREE.MeshBasicMaterial({ visible: false });
     const hitMesh = new THREE.Mesh(hitGeo, hitMat);
     const localCenter = new THREE.Vector3(center.x, hitCenterY, center.z);
@@ -3173,16 +3178,17 @@ function buildWaterLilyProto(type) {
     }
     /* ⑤ 合并绘制批次（手机流畅） */
     mergeGroupByMaterial(g);
-    /* ⑥ 加隐形点选盒（保证能点中、能拖动、能长按删除） */
+    /* ⑥ 加隐形点选盒（保证能点中、能拖动、能长按删除）★ 2026.9.24 同步收小 */
     const bb = new THREE.Box3().setFromObject(g);
     const sz = bb.getSize(new THREE.Vector3()), ct = bb.getCenter(new THREE.Vector3());
+    const _hw = Math.max(sz.x * 0.72, 0.09), _hh = Math.max(sz.y * 0.85, 0.06), _hd = Math.max(sz.z * 0.72, 0.09);
     const hit = new THREE.Mesh(
-        new THREE.BoxGeometry(Math.max(sz.x, 0.12), Math.max(sz.y, 0.08), Math.max(sz.z, 0.12)),
+        new THREE.BoxGeometry(_hw, _hh, _hd),
         new THREE.MeshBasicMaterial({ visible: false })
     );
     hit.position.copy(ct); hit.userData.isHitbox = true;
     g.add(hit);
-    g.userData.bbSize = [Math.max(sz.x, 0.12), Math.max(sz.y, 0.08), Math.max(sz.z, 0.12)];
+    g.userData.bbSize = [_hw, _hh, _hd];
     g.userData.bbCenter = [ct.x, ct.y, ct.z];
     return g;
 }
@@ -3870,6 +3876,7 @@ function _reuploadTextures(root) {
 
 function createObject(type, pos) {
     if (Date.now() - CHAT_TAP_TS < 2500) return;   /* ★ 刚点过人物(说话/打断) → 2.5秒内绝不放置任何模型 */
+    pickedByTap = false;   /* ★ 2026.9.24：放置后自动选中的不算"手动点选" → 可连续点地面连续放 */
     if (type.startsWith('cloud_')) {
         const _person = _isPersonType(type);
         /* ★ 唯一能"多出人物"的入口：通话中 / 刚点过人物时，场景已有人物就直接拒绝新增 */
@@ -4658,6 +4665,7 @@ function setupInteractions() {
 
     const handleInteractStart = (clientX, clientY, touchesLength) => {
         hitExistingObject = false;
+        justDeselected = false;                  /* ★ 2026.9.24：每次点击先复位 */
         try { sweepGhosts(); } catch (e) {}      // ★ 残留模型立刻变成可点选/可删除
         hideFloatPanels();
         touchStartPos.set(clientX, clientY);
@@ -4681,6 +4689,13 @@ function setupInteractions() {
                 } else showSysToast('该对象不是可撒播的面');
                 return;
             }
+            /* ★ 2026.9.24：点空白 → 只取消选中（本次不放模型）；再点一次才放 */
+            const _clearSel = () => {
+                if (selectedObj && pickedByTap) justDeselected = true;
+                pickedByTap = false;
+                selectObject(null);
+                document.getElementById('delete-toast').style.display = 'none';
+            };
             if (result) {
                 const target = result.target;
                 const isPaving = target.userData.isPaving;
@@ -4688,14 +4703,13 @@ function setupInteractions() {
                 if (isModel || (isPaving && currentMode === 'path')) {
                     hitExistingObject = true;   // 命中已有对象：只选中/拖动
                     selectObject(target);
+                    pickedByTap = true;         // ★ 这是"用户手动点选"
                     isLongPressActive = false;
                     longPressTimer = setTimeout(() => { isLongPressActive = true; document.getElementById('delete-toast').style.display = 'flex'; document.getElementById('delete-backdrop').style.display = 'block'; }, 800);
                     isDraggingModel = true;
                     dragPlane.setFromNormalAndCoplanarPoint(new THREE.Vector3(0, 1, 0), target.position);
-                } else { selectObject(null); document.getElementById('delete-toast').style.display = 'none';
-                }
-            } else { selectObject(null); document.getElementById('delete-toast').style.display = 'none';
-                }
+                } else _clearSel();
+            } else _clearSel();
         }
     };
     window.addEventListener('touchstart', (e) => {
@@ -4775,8 +4789,11 @@ function setupInteractions() {
             if (!pt && lastHitPose) pt = new THREE.Vector3(lastHitPose.transform.position.x, groundLevel, lastHitPose.transform.position.z);
 
             if (currentMode === 'object' && pt) {
-                // 点在已有模型上 → 只选中它；点在空白/铺装上 → 才放置新模型
-                if (!hitExistingObject) createObject(currentAsset.id, pt);
+                // 点在已有模型上 → 只选中它；手动选过模型后点空白 → 先取消选中；再点才放置
+                if (!hitExistingObject) {
+                    if (justDeselected) { justDeselected = false; showSysToast('已取消选中'); }
+                    else createObject(currentAsset.id, pt);
+                }
             }
             else if (currentMode === 'path') {
                 raycaster.setFromCamera(mouse, getRayCamera());
@@ -6554,8 +6571,27 @@ const SF_MODELS = AGNES_MODELS;
 
 /* ★③ 云端情感语音（TTS）：比手机自带朗读像真人得多 */
 const SF_TTS_MODEL = 'FunAudioLLM/CosyVoice2-0.5B';
+/* ★ 2026.9.23 新增：声线预设 = 官方基础音色 + 固定语气指令 + 专属语速 */
+/* ★ 2026.9.24：古风声线统一调成"成熟温柔、音色柔和舒缓、语调平稳温润"
+   —— 去掉尖细清脆的少女感，作为造景顾问听着更稳、更让人安心。
+   （若想回到更清亮的旧声线：把 guzheng/guanyin 的 base 改回 'claire'、spd 各 +0.06 即可） */
+const SF_VOICE_STYLE = {
+    guixiu:  { base: 'bella',  spd: 0.90,
+        style: '用一位成熟温婉的古代书香门第女子的声线说话：嗓音偏低偏厚、圆润柔和，气息沉稳绵长，'
+             + '语速缓慢从容、语调平稳，吐字清晰而轻，句尾自然下沉收住；'
+             + '不要清脆尖细的少女音，不要嗲、不要刻意上扬、不要急促，像一位说话让人安心的年长姐姐在低声细语' },
+    guzheng: { base: 'bella',  spd: 0.92,
+        style: '用一位成熟娴静的江南抚筝女子的声线说话：音色温润偏低、柔和舒缓，语速慢而平稳，'
+             + '气息匀稳、尾音轻轻放下；不要清亮尖细的少女音，不要活泼跳跃' },
+    guanyin: { base: 'bella',  spd: 0.84,
+        style: '用观世音菩萨的声线说话：音色低沉柔和、慈悲庄严，语速极缓、气息绵长匀稳，'
+             + '每字温厚落地，不急不躁、不轻不飘，绝无少女感' }
+};
 const SF_VOICES = [
-    { id: 'bella',    name: '🌸 Bella 温柔女声（推荐·最像豆包）' },
+    { id: 'guixiu',   name: '📜 书香女子 成熟温柔·舒缓（古风·推荐）' },
+    { id: 'guzheng',  name: '🎼 抚筝女子 温润娴静·舒缓（古风）' },
+    { id: 'guanyin',  name: '🧘 观音 低沉柔和·慈悲庄严' },
+    { id: 'bella',    name: '🌸 Bella 温柔女声（现代）' },
     { id: 'anna',     name: '💃 Anna 活力女声' },
     { id: 'diana',    name: '😄 Diana 甜美女声' },
     { id: 'claire',   name: '🍃 Claire 轻柔女声' },
@@ -6564,6 +6600,27 @@ const SF_VOICES = [
     { id: 'benjamin', name: '🔊 Benjamin 低沉男声' },
     { id: 'david',    name: '☀️ David 欢快男声' }
 ];
+/* ★ 角色 → 专属声线（⚙ 里可关掉"按角色自动配音"改为手动） */
+const CHAR_VOICE = {
+    '观音': 'guanyin',
+    '唐代美人': 'guixiu',
+    '古装美人': 'guixiu',
+    '唐代女': 'guixiu',
+    '古筝女': 'guzheng'
+};
+function charVoiceId(name) { return CHAR_VOICE[name] || ''; }
+function curVoiceId() {
+    if (VC.set.autoVoice !== false && chatTarget) {
+        const v = charVoiceId(characterName(chatTarget));
+        if (v) return v;
+    }
+    return VC.set.sfVoice || 'guixiu';
+}
+function resolveVoice(id) {
+    const p = SF_VOICE_STYLE[id];
+    return p ? { voice: p.base, style: p.style, spd: (p.spd || 1) }
+             : { voice: (id || 'bella'), style: '', spd: 1 };
+}
 
 /* ★④ 云端语音识别（ASR）：SenseVoiceSmall，免费、中文准、不卡、没有叮咚提示音 */
 const SF_ASR_MODEL = 'FunAudioLLM/SenseVoiceSmall';
@@ -6909,8 +6966,8 @@ const VC = {
     set: {
         model: AGNES_MODELS[0].id,
         voice: 'female',  // female / male
-        rate: 0.96,       // 语速 0.6~1.6（0.96 更柔和、更像真人）
-        pitch: 1.06,      // 音调 0.4~1.8（1.06 自然温柔；1.25 会发嗲失真）
+        rate: 0.94,       // 语速 0.6~1.6（★2026.9.24 稍慢 → 柔和舒缓）
+        pitch: 0.90,      // 音调 0.4~1.8（★2026.9.24 压低 → 成熟温润，去掉少女尖细感）
         barge: true,      // 允许语音打断
         sub: false,       // 字幕（默认关）
         txt: false,       // 文字输入框（默认关）
@@ -7167,17 +7224,21 @@ const SF_SILENT = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIh
 /* ★ 强制迁移到"最优方式"：云端识别 + 云端情感语音（旧手机存的 local 会被纠正回来） */
 if (VC.set.tts     === undefined) VC.set.tts = 'cloud';
 if (VC.set.asr     === undefined) VC.set.asr = 'cloud';
-if (VC.set.sfVoice === undefined) VC.set.sfVoice = 'bella';
+if (VC.set.sfVoice === undefined) VC.set.sfVoice = 'guixiu';
+if (VC.set.autoVoice === undefined) VC.set.autoVoice = true;   /* ★ 按角色自动配音 */
 if (VC.set.emo     === undefined) VC.set.emo = true;
 if (VC.set.sens    === undefined) VC.set.sens = 0.032;   /* ★ 麦克风灵敏度门限：越大越不容易误触发 */
 if (VC.set.ptt     === undefined) VC.set.ptt = false;    /* ★ 按住说话（最防误触发） */
 if (VC.set.share   === undefined) VC.set.share = true;   /* ★ 接通即共享画面，她默认"看得见" */
-if (VC.set._v !== 4) {                       // 只纠正一次
-    VC.set._v = 4;
+if (VC.set._v !== 6) {                       // 只纠正一次
+    VC.set._v = 6;
     VC.set.tts = 'cloud';                    // 默认云端情感语音
-    VC.set.asr = 'cloud';                    // 默认云端识别（浏览器识别才有"叮"提示音）
+    VC.set.asr = 'cloud';                    // 默认云端识别（无"叮"提示音）
     VC.set.share = true;                     // 默认开启看画面
-    VC.set.rate = 1.00; VC.set.pitch = 1.02; // 更自然，不发嗲
+    VC.set.autoVoice = true;                 // 按角色自动配音
+    VC.set.sfVoice = 'guixiu';               // 默认书香女子声线
+    VC.set.rate = 0.94; VC.set.pitch = 0.90; // ★2026.9.24 更成熟温润、柔和舒缓
+    VC.set.sens = 0.042;                     // 更不容易被杂声误触发
 }
 if (String(VC.set.model || '').indexOf('agnes') === 0 ||
     AGNES_MODELS.findIndex(m => m.id === VC.set.model) < 0) VC.set.model = AGNES_MODELS[0].id;
@@ -7245,9 +7306,12 @@ function sfPlayURL(url) {
 
 /* ---------- 云端合成一句 ---------- */
 async function sfTTS(text, emo) {
-    const ins = SF_EMO[emo || ''] || '';
+    const rv = resolveVoice(curVoiceId());
+    const emoIns = (VC.set.emo === false) ? '' : (SF_EMO[emo || ''] || '');
+    /* 声线指令在前、情感指令在后 → 角色声线稳定不跑，情绪照样听得出来 */
+    const ins = rv.style ? (rv.style + (emoIns ? ('，并且' + emoIns) : '')) : emoIns;
     const ctl = new AbortController();
-    const to = setTimeout(() => { try { ctl.abort(); } catch (e) {} }, 16000);
+    const to = setTimeout(() => { try { ctl.abort(); } catch (e) {} }, 18000);
     try {
         const r = await fetch(SF_TTS_URL(), {
             method: 'POST', signal: ctl.signal,
@@ -7255,10 +7319,10 @@ async function sfTTS(text, emo) {
             body: JSON.stringify({
                 model: SF_TTS_MODEL,
                 input: (ins ? (ins + '<|endofprompt|>') : '') + text,
-                voice: SF_TTS_MODEL + ':' + (VC.set.sfVoice || 'bella'),
+                voice: SF_TTS_MODEL + ':' + rv.voice,
                 response_format: 'mp3',
-                sample_rate: 32000,
-                speed: Math.max(0.5, Math.min(2, VC.set.rate || 1)),
+                sample_rate: 44100,                                   /* ★ 咬字更清亮 */
+                speed: Math.max(0.5, Math.min(2, (VC.set.rate || 1) * (rv.spd || 1))),
                 gain: Math.max(-10, Math.min(10, Math.round(((VC.set.vol != null ? VC.set.vol : 1) - 1) * 8)))
             })
         });
@@ -7348,7 +7412,7 @@ function _ttsIdle() {
 async function _ttsPumpCloud(my) {
     const pre = [];                                  // ★ 预取 2 句，边说边下载
     const fill = () => {
-        while (pre.length < 2 && ttsQ.length > 0) {
+        while (pre.length < 3 && ttsQ.length > 0) {
             const s = ttsQ.shift();
             pre.push({ seg: s, p: sfTTS(s, SF_EMO_NOW).catch(() => null) });
         }
@@ -7433,16 +7497,16 @@ function useCloudASR() {
 
 /* ---------- 麦克风闸门参数（可在设置面板里滑动条现场调灵敏度） ---------- */
 const MIC = {
-    absOn:     0.032,   // 绝对能量门限（设置里的"麦克风灵敏度"会覆盖它）
-    onMul:     3.2,     // 起始门限 = 底噪 × 3.2
-    offMul:    1.8,     // 结束门限 = 底噪 × 1.8
-    bargeMul:  7.0,     // 她说话时要打断，门限倍数
-    startMs:   300,     // 必须连续 300ms 有人声，才算"你开口了"
-    endMs:     620,     // 静音 620ms 才算"你说完了"
-    minVoiceMs:420,     // 一段录音里累计人声不足 420ms → 直接丢掉不识别
-    peakMul:   1.25,    // 段内峰值必须 ≥ 灵敏度 × 1.25
-    tailMs:    1100,    // 她说完后的回声静默期
-    bargeMs:   420      // 打断需要持续 420ms 的清晰人声
+    absOn:     0.042,   // 绝对能量门限（设置里的"麦克风灵敏度"会覆盖它）
+    onMul:     3.8,     // 起始门限 = 底噪 × 3.8
+    offMul:    1.9,     // 结束门限 = 底噪 × 1.9
+    bargeMul:  7.5,     // 她说话时要打断，门限倍数
+    startMs:   420,     // 必须连续 420ms 有人声，才算"你真的在跟我说话"
+    endMs:     700,     // 静音 700ms 才算"你说完了"（句子更完整）
+    minVoiceMs:600,     // 一段录音累计人声不足 600ms → 当杂声丢掉
+    peakMul:   1.50,    // 段内峰值必须够响，远处电视/键盘/走路声全过不了
+    tailMs:    1300,    // 她说完后的回声静默期
+    bargeMs:   520      // 打断需要持续 520ms 的清晰人声
 };
 function micSens() { return Math.max(0.010, Math.min(0.120, VC.set.sens || MIC.absOn)); }
 const PTT = { hold: false };
@@ -7598,6 +7662,15 @@ function recCut(send) {
 const ASR_LAST = { t: '', at: 0 };
 const ASR_NOISE = /^[\s，。、,.!?！？~\-—…()（）【】\[\]"']*(?:(?:嗯|啊|哦|噢|喔|唔|呃|额|欸|哎|唉|呀|哈|嘿|哼|喂|咦|哟|嘛|吧|呢|喽|噜|那个|这个|然后|就是|好的|好吧|ok|okay|uh|um|ah|oh|hm+|mm+|en|yeah|yep|hi|hello|bye|the|a|i|you)[\s，。、,.!?！？~\-—…]*)+$/i;
 const ASR_HALLU = /(谢谢观看|感谢观看|谢谢大家|请?订阅|点赞|投币|转发|关注一下|字幕|明镜|与点点栏目|不吝|打赏|下期再见|拜拜|MBC|뉴스|ご視聴|ありがとう|Thanks\s*for\s*watching|Subscribe)/i;
+/* ★ 2026.9.23：只回应"我主动跟她说的话"——疑问 / 指令 / 完整句子才算，杂声与自言自语一律不理 */
+const RX_ASK = /(吗|呢|吧|么|嘛|什么|啥|怎么|怎样|如何|为什么|为啥|为何|哪|哪里|哪个|哪些|几|多少|多久|多大|多高|多宽|是不是|有没有|能不能|可不可以|行不行|好不好|要不要|该不该|可以|能否|帮我|帮忙|告诉|教教|教我|说说|讲讲|讲下|说下|看看|瞧瞧|查|搜|介绍|推荐|建议|意见|方案|设计|布置|摆|放|种|做|算|测|问你|请问|你说|你看|你觉得|你会|你能|你知道|风水|景观|铺装|水池|池塘|树池|栏杆|凉亭|假山|植物|绿化)/;
+function asrIsAsk(raw) {
+    const s = String(raw || '').replace(/[\s，。、,.!?！？~\-—…()（）【】\[\]"'：:；;]/g, '');
+    if (s.length < 4) return false;                  // 太短一律当杂声
+    if (/[?？]/.test(String(raw))) return true;       // 明确问句
+    if (RX_ASK.test(s)) return true;                  // 含疑问词 / 指令词 / 专业词
+    return s.length >= 8;                             // 足够长的完整句子也算主动说话
+}
 function asrTextOK(raw) {
     const r = String(raw || '');
     const s = r.replace(/[\s，。、,.!?！？~\-—…()（）【】\[\]"'：:；;]/g, '');
@@ -7648,6 +7721,8 @@ async function sfASRSend() {
         REC.busy = false;
         if (!asrTextOK(t)) { vcStatus('● 聆听中'); return; }
         if (looksLikeEcho(t) && (ovl || ttsSpeaking || Date.now() - SPEAK_END_TS < 2500)) { vcStatus('● 聆听中'); return; }
+        /* ★ 只回应主动提问；"按住说话"模式下你显然是在说，所以不再过滤 */
+        if (!VC.set.ptt && !asrIsAsk(t)) { vcStatus('● 聆听中（未识别为提问）'); return; }
         vcStatus('👤 ' + t.slice(0, 12));
         sendChat(t);
     } catch (e) {
@@ -7769,7 +7844,7 @@ async function recStart() {
             recTimer = setTimeout(() => {
                 const t = (recBuf + interim).trim();
                 recBuf = '';
-                if (t.replace(/[\s，。、,.!?！？]/g, '').length >= 2) sendChat(t);
+                if (asrTextOK(t) && (VC.set.ptt || asrIsAsk(t))) sendChat(t);
                 else vcStatus('● 聆听中');
             }, fin ? 620 : 950);
         };
@@ -8163,12 +8238,26 @@ function dirWord(deg) {
     return deg > 0 ? '右后方' : '左后方';
 }
 function visHeadingTag() { return '朝' + dirWord(camYawDeg()) + '看到'; }
-/* 场地实况：只在用户问布置/方位时才注入，AI 被严令禁止主动播报 */
+/* 场地实况：只在用户问布置/方位时才注入，AI 被严令禁止主动播报
+   ★ 2026.9.24 增强：每个已放对象都给 编号/方位/距离/离地毫米/Y向角度/大致尺寸，
+     另附 当前模式、所选素材、底部数值、当前选中对象 → AI 就能像"看着屏幕"一样分步指导 */
 function sceneFacts() {
     const out = [];
     const yaw = camYawDeg();
     out.push('用户当前朝向：' + (Math.abs(yaw) <= 8 ? '与进入AR时一致'
         : ('相对进入时向' + (yaw > 0 ? '右' : '左') + '转了约' + Math.abs(Math.round(yaw)) + '度')));
+    const objName = (o) => {
+        const ud = o.userData || {};
+        if (ud.isScatter) return '组合种植区';
+        if (ud.isPondWithEdge) return '叠石池塘';
+        if (ud.isCurbWithFill) return '路缘石铺装';
+        if (ud.isFence) return '石栏杆';
+        if (ud.isPathObj) return invName(ud.modelId) + '带';
+        if (ud.id === 'tree_pool') return '树池';
+        if (ud.isPaving) return invName(ud.assetId);
+        return invName(ud.id);
+    };
+    const degY = (o) => Math.round((((THREE.MathUtils.radToDeg(o.rotation.y) % 360) + 360) % 360));
     try {
         const cam = getRayCamera();
         const cp = new THREE.Vector3().setFromMatrixPosition(cam.matrixWorld);
@@ -8179,23 +8268,35 @@ function sceneFacts() {
         const right = new THREE.Vector3().crossVectors(fwd, new THREE.Vector3(0, 1, 0)).normalize();
         const items = [];
         placedObjects.forEach(o => {
-            const ud = o.userData || {};
-            let nm;
-            if (ud.isScatter) nm = '组合种植区';
-            else if (ud.isPondWithEdge) nm = '叠石池塘';
-            else if (ud.isCurbWithFill) nm = '路缘石铺装';
-            else if (ud.isFence) nm = '石栏杆';
-            else if (ud.isPathObj) nm = invName(ud.modelId) + '带';
-            else if (ud.id === 'tree_pool') nm = '树池';
-            else if (ud.isPaving) nm = invName(ud.assetId);
-            else nm = invName(ud.id);
+            if (items.length >= 20) return;
             const p = new THREE.Vector3(); o.getWorldPosition(p);
             const d = new THREE.Vector3(p.x - cp.x, 0, p.z - cp.z);
             const deg = THREE.MathUtils.radToDeg(Math.atan2(d.dot(right), d.dot(fwd)));
-            items.push(nm + ' ' + dirWord(deg) + ' ' + d.length().toFixed(1) + '米');
+            let s = '#' + (items.length + 1) + ' ' + objName(o) + '：' + dirWord(deg) + '约' + d.length().toFixed(1) + '米';
+            const hmm = Math.round((p.y - groundLevel) * 1000);
+            if (hmm > 2) s += '，离地' + hmm + '毫米';
+            const ry = degY(o);
+            if (ry > 1) s += '，Y向' + ry + '度';
+            const bb = o.userData.bbSize;
+            if (bb) s += '，约' + Math.round(bb[0] * Math.abs(o.scale.x) * 100) + '×'
+                       + Math.round(bb[1] * Math.abs(o.scale.y) * 100) + '×'
+                       + Math.round(bb[2] * Math.abs(o.scale.z) * 100) + '厘米';
+            items.push(s);
         });
-        out.push(items.length ? ('已布置：' + items.slice(0, 16).join('；') + (items.length > 16 ? ' 等' : ''))
+        out.push(items.length ? ('已布置（共 ' + placedObjects.length + ' 项，按放置先后）：\n' + items.join('\n')
+                                 + (placedObjects.length > 20 ? '\n（其余略）' : ''))
                               : '场地目前完全是空的，还没摆任何东西');
+    } catch (e) {}
+    try {
+        const _sp = document.getElementById('path-spacing');
+        out.push('当前状态：模式=' + (currentMode === 'path' ? '路径绘制' : '景观摆放')
+            + '；已选素材=' + ((currentAsset && currentAsset.name) || '无')
+            + '；底部数值框=' + ((_sp && _sp.value) || '-') + 'mm'
+            + '；画线方式=' + (cornerMode === 'sharp' ? '直角' : '圆滑')
+            + (tpoolMode ? ('；树池工具=' + (tpoolMode === 1 ? '圆形' : '六角')) : ''));
+        if (selectedObj) out.push('用户此刻选中的是：' + objName(selectedObj)
+            + '（离地 ' + Math.round((selectedObj.position.y - groundLevel) * 1000) + ' 毫米，Y向 ' + degY(selectedObj) + ' 度）');
+        else out.push('用户此刻没有选中任何模型');
     } catch (e) {}
     if (VIS.on && VIS.mem.length) out.push('看过的环境：' + VIS.mem.slice(-8).join('；'));
     return out.join('\n');
@@ -8227,21 +8328,72 @@ async function liveWeather(q) {
 }
 /* ---------- 给 AI 的即时资料包 ---------- */
 /* ★ 只有真的在问"画面/造景/天气/要联网"时才注入文字资料，避免 AI 被带跑题 */
-const RX_LAY = /(景观|造景|布置|铺装|路径|水池|池塘|花池|树池|栏杆|凉亭|假山|草地|绿化|种植|摆放|放哪|摆哪|设计方案|平面|间距|面积)/;
+const RX_LAY = /(景观|造景|布置|铺装|路径|水池|池塘|花池|花坛|树池|栏杆|凉亭|亭子|石桥|拱桥|汀步|假山|叠石|山石|石头|石灯|草地|草坪|绿化|种植|摆放|摆件|放哪|摆哪|设计方案|方案|平面|间距|面积|高度|角度|偏移|编号|模型)/;
 const RX_WX  = /(天气|气温|温度|下雨|降雨|台风|风力|湿度|冷不冷|热不热|晴天|阴天|下雪)/;
 /* ★ 这两个原来被用到却从没定义过 → 一提问就 ReferenceError，人物永远不回答。补上： */
 const RX_NET = /(最新|今天|今日|昨天|明天|现在|实时|新闻|头条|股价|股票|基金|汇率|油价|金价|比分|赛程|冠军|票价|机票|车票|房价|发布|上市|多少钱|价格|报价|行情|排行|排名|查一下|查查|搜一下|搜索|百度|谷歌|资料|规范|标准|几点|哪一年|是谁|简介|百科)/;
 const RX_VIS = /(看|瞧|画面|镜头|屏幕|这是什么|那是什么|什么东西|几个|多少个|数一数|颜色|什么色|字|写的什么|念一下|牌子|品牌|型号|标签|说明书|拍到|认一下|识别)/;
+/* ★ 2026.9.24 新增：用户要"分步施工指导"的说法 */
+const RX_BUILD = /(教我|指导|带我|一步|分步|步骤|下一步|下一块|接下来|然后呢|怎么做|怎么摆|怎么放|怎么叠|怎么搭|怎么建|怎么弄|怎么设计|帮我做|帮我摆|帮我放|帮我设计|我想做|我要做|想做|做一座|做一个|堆一座|叠一座|摆一|放一|哪一块|哪一个|哪个编号|第几块|用几号|选几号)/;
+
+/* ★ 造景指导用的「模型清单」：从 CLOUD_MODELS / ASSETS 自动生成，永不过时。
+   —— 云库图标上看不出编号，AI 必须照抄这里的原名（例如"假山石3"）报给用户 */
+function modelCatalog() {
+    const lines = [], grp = {}, order = [];
+    CLOUD_MODELS.forEach(m => {
+        const c = CLOUD_CATEGORIES.find(x => x.id === m.cat);
+        const k = (c && c.name) || m.cat;
+        if (!grp[k]) { grp[k] = []; order.push(k); }
+        grp[k].push(m.name);
+    });
+    order.forEach(k => lines.push('· 底部「☁️ 云库」→「' + k + '」共 ' + grp[k].length + ' 款：' + grp[k].join('、')));
+    lines.push('· 底部「路径绘制」素材栏：' + ASSETS.path.map(a => a.name).join('、'));
+    lines.push('· 底部「景观摆放」素材栏：' + ASSETS.object.map(a => a.name).join('、'));
+    lines.push('※ 云库图标上看不出编号，指导用户时必须把名字连编号一起报出来，例如"假山石3""造型黑松1""荷花4"。');
+    return lines.join('\n');
+}
+
+/* ★ 本软件真实操作步骤：AI 指导时按这个说，用户才点得到 */
+const OPS_GUIDE = [
+    '【本软件操作要点（指导用户时照这个说）】',
+    '· 放单个模型：点底部「☁️ 云库」→ 选分类 → 选模型 → 顶部切「景观摆放」→ 点地面即落地。',
+    '· 成排/沿线排布：顶部切「路径绘制」→ 选模型 → 底部填「间距(mm)」→ 按住「按住画线」画路线 → 点「生成幻景」。',
+    '· 铺装/草地/池塘：「路径绘制」里选材质（如 青石板方拼、叠石池塘、路缘石+铺装）→ 画一圈闭合区域 → 「生成幻景」。',
+    '· 离地高度：选中模型 → 右侧「离地高度」竖滑杆；或「⬆层 / ⬇层」按钮，每次 20 毫米（2 厘米）。',
+    '· 旋转：选中后右侧「轴:Y」可切 X/Y/Z 轴，用旋转盘 X± Y± Z±；点中间按钮切每次 1°/5°/15°/45°/90°；「归零」复位。',
+    '· 平移偏移：手指按住模型直接拖动即可左右前后微调。',
+    '· 缩放：两指捏合；「1:1」按钮恢复真实尺寸。',
+    '· 树池：工具箱🧰→「画池」（圆形/六角）→ 底部填直径(mm) → 点底部大按钮精准放置。',
+    '· 组合种植：工具箱🧰→「组合」勾选多种植物 → 调间距/大小 → 「用画的区域生成」或「点选已有面/水池」。',
+    '· 精准放线：工具箱🧰→「放线」点起点再点终点，配合「自由/90°」锁角，可先放样再摆石。',
+    '· 材料统计：工具箱🧰→「存档」→「📋 材料清单」。'
+].join('\n');
+
+/* ★ 分步指导模式的硬性规矩（只在用户开口要指导时才注入） */
+const STEP_HINT = [
+    '【本轮请进入「分步造景指导」模式】',
+    '· 一次只讲一步，每步不超过约 110 字，讲完就停，等用户说"好了/放好了/下一步"再给下一步，绝不一次报完全部。',
+    '· 每一步必须报全五件事：① 选哪个模型（照抄清单原名含编号，如"假山石3"）② 在哪里选（云库哪个分类 / 底部哪个素材栏）'
+        + '③ 放在哪（用 正前方/左前方/右前方/正左方/正右方 加大约几米，或相对上一块的左/右/前/后）'
+        + '④ 离地高度多少厘米（提示用右侧"离地高度"滑杆或⬆层按钮）⑤ 旋转（哪个轴转多少度）与左右偏移多少厘米；需要时说清开口/正面朝向。',
+    '· 位置优先用"以刚放好的那块为基准"的说法，例如"叠在假山石1的右上方，比它高5厘米，往左偏2厘米"。',
+    '· 用户报完一步进度，就顺势给下一块，可用一句话点评（如"这块压得好，山势就出来了"）。',
+    '· 用户跳步、改主意、想换石头，一律听他的，不要坚持自己的顺序。',
+    '· 【场地实况】里的数据就是你此刻"看到"的幻境画面（AR 虚拟模型不会出现在摄像头照片里），谈已摆好的东西一律以这份数据为准，不要说"画面里没有"。',
+    '· 他不问就安静，绝不主动催他、绝不主动播报进度。'
+].join('\n');
 /* ★内置「景观风水 + 工程尺寸」知识库：用户问造景/布局时自动喂给AI，配合实时朝向/坐标使用 */
 const LANDSCAPE_KB = [
     '【坐向与明堂】理想格局"前朱雀、后玄武、左青龙、右白虎"：宅前留开阔明堂（视野/水景/草坪）聚气；宅后宜有靠山（假山、乔木林、景墙）为依托；坐北朝南采光最佳。',
     '【水法】水宜曲折环抱、缓流有情，忌直冲大门、忌反弓；池塘忌正对大门中轴，宜偏于一侧；水面不宜过大压过建筑，池岸宜做自然驳岸。',
-    '【植物宜忌】大门与窗前忌高大乔木正对遮挡；庭院正中心忌种大树；宜前低后高、层次分明；带刺、枯木、藤缠忌近主入口。',
-    '【园路尺寸】主园路宽1.2~2.0m（双人并行取1.5m）；次园路0.6~1.0m；汀步中心间距55~65cm、单块约40×50cm；步道纵坡宜<8%。',
+    '【植物宜忌】大门与窗前忌高大乔木正对遮挡；庭院正中心忌种大树；宜前低后高、层次分明；带刺、枯木、藤缠忌近主入口；东南栽竹、西北植松柏为佳。',
+    '【化解办法】直冲用照壁、景墙或一丛竹遮挡；缺角用假山石、石灯、造型松补位；煞气重处以圆形树池、圆润卵石铺装化解。',
+    '【园路尺寸】主园路宽1.2~2.0m（双人并行取1.5m）；次园路0.6~1.0m；汀步中心间距55~65cm、单块约40×50cm。',
     '【树池/种植】树池净直径乔木≥1.5m、大乔木≥2.0m；乔木株距4~6m，小乔木3~4m，大灌木1.5~2.5m，绿篱30~50cm，地被花卉15~30cm。',
-    '【水景/铺装】观赏水池水深0.3~0.6m（安全<0.6m）；驳岸石露出水面10~20cm；铺装找坡1%~2%排水；台阶踏步高12~16cm、宽30~35cm。',
-    '【景亭/构筑】亭子净高2.4~2.8m、六角亭对角3~4m；园桥净宽≥1.2m；临水/临空栏杆高≥1.05m。',
-    '答景观问题时：先按用户给的坐向/场地实况判断格局优劣，再给"具体位置+推荐尺寸+植物/材料"的可落地建议，能用本软件的路径/铺装/水池/树池/组合种植功能实现的就顺带告诉他怎么点。'
+    '【水景·虚拟造景不算水深】本软件是AR虚拟造景，不需要考虑水深、防水与基础做法：水池只看平面位置、形状与大小（庭院观赏池一般2~6㎡，宜偏于一侧、曲折环抱），驳岸石露出水面约10~20cm、大小相间自然错落。',
+    '【铺装/台阶】铺装样式与庭院风格统一，中式宜青石板碎拼、卵石拼花；台阶踏步高12~16cm、宽30~35cm。',
+    '【景亭/构筑】亭子净高2.4~2.8m、六角亭对角3~4m；园桥净宽≥1.2m；临水或临空栏杆高≥1.05m。',
+    '答景观问题时：先按用户给的坐向与场地实况判断格局优劣，再给"具体位置+推荐尺寸+植物或材料"的可落地建议，能用本软件的路径/铺装/水池/树池/组合种植功能实现的就顺带告诉他怎么点；不要提水深与施工做法。'
 ].join('\n');
 /* ★★ 2026.9.22 关键修复 ★★
    下面这份 liveWeather 与上面那份完全重复。
@@ -8395,7 +8547,14 @@ async function webSearch(q) {
 async function buildContext(text) {
     const parts = [];
     if (RX_WX.test(text)) { const w = await liveWeather(text); if (w) parts.push(w); }
-    if (RX_LAY.test(text)) parts.push('【景观造景·风水与尺寸规则】\n' + LANDSCAPE_KB + '\n【场地实况】\n' + sceneFacts());
+    /* ★ 2026.9.24：造景类提问 → 注入 风水尺寸规则 + 场地实况 + 可用模型清单 + 软件操作说明 */
+    const _wantBuild = RX_BUILD.test(text);
+    if (RX_LAY.test(text) || _wantBuild) {
+        parts.push('【景观造景·风水与尺寸规则】\n' + LANDSCAPE_KB + '\n【场地实况】\n' + sceneFacts());
+        parts.push('【可用模型清单（报名称/编号必须照抄这里的原名）】\n' + modelCatalog());
+        parts.push(OPS_GUIDE);
+    }
+    if (_wantBuild) parts.push(STEP_HINT);
     if (RX_NET.test(text)) {
         vcStatus('🌐 联网查资料…');
         const w = await webSearch(text);
@@ -8410,13 +8569,29 @@ async function buildContext(text) {
 /* ============ 五、调用硅基流动（OpenAI 兼容 · 流式 · 自动降级） ============ */
 /* ---------- 人物档案：谁问都答得出几岁、哪里来、谁做的 ---------- */
 const CHAR_PROFILE = {
-    '观音':     { age: '我不按凡人的岁数算，若你一定要问，便是千百年了', from: '南海普陀山', self: '我是观音，自南海普陀而来' },
-    '唐代美人': { age: '妾身今年十九', from: '大唐长安城',   self: '妾身是唐代美人，来自大唐长安' },
-    '唐代女':   { age: '妾身今年十八', from: '大唐洛阳城',   self: '妾身是唐代女子，来自大唐洛阳' },
-    '古筝女':   { age: '我今年二十一', from: '江南水乡',     self: '我是抚筝的姑娘，来自江南水乡' },
-    '_def':     { age: '我今年二十岁', from: '幻境里的江南园林', self: '我是幻境里的人' }
+    '观音':     { age: '我不按凡人的岁数算，若你一定要问，便是千百年了', from: '南海普陀山', self: '我是观音，自南海普陀而来',
+                  tone: '自称"我"，称对方"施主"，沉稳柔和、慈悲庄严，偶尔一句"善哉"，绝不轻浮' },
+    '唐代美人': { age: '妾身今年十九', from: '大唐长安城', self: '妾身是唐代美人，来自大唐长安',
+                  tone: '书香门第小姐口吻：自称"妾身"，称对方"公子"，贤淑温柔、端庄含蓄、轻声有礼' },
+    '古装美人': { age: '妾身今年十九', from: '大唐长安城', self: '妾身是古装美人，来自大唐长安',
+                  tone: '书香门第小姐口吻：自称"妾身"，称对方"公子"，贤淑温柔、端庄含蓄、轻声有礼' },
+    '唐代女':   { age: '妾身今年十八', from: '大唐洛阳城', self: '妾身是唐代女子，来自大唐洛阳',
+                  tone: '书香门第小姐口吻：自称"妾身"，称对方"公子"，贤淑温柔、端庄含蓄、轻声有礼' },
+    '古筝女':   { age: '小女子今年二十一', from: '江南水乡', self: '我是抚筝的姑娘，来自江南水乡',
+                  tone: '江南闺秀口吻：自称"小女子"，称对方"公子"，清雅温婉、轻声细语' },
+    '_def':     { age: '我今年二十岁', from: '幻境里的江南园林', self: '我是幻境里的人',
+                  tone: '亲切自然、口语化，像身边的朋友' }
 };
 function charProf(name) { return CHAR_PROFILE[name] || CHAR_PROFILE._def; }
+/* ★ 各角色固定开场：点它接通时只说这一句，之后不提问绝不开口 */
+const CHAR_GREET = {
+    '观音':     '【温柔】阿弥陀佛，施主你好，善哉善哉。',
+    '唐代美人': '【古风】妾身见过公子。长安一别千年，今日与公子相逢于此，公子有话请讲。',
+    '古装美人': '【古风】妾身见过公子。长安一别千年，今日与公子相逢于此，公子有话请讲。',
+    '唐代女':   '【古风】妾身见过公子。洛阳城中一别，今又相见，公子但问无妨。',
+    '古筝女':   '【古风】公子安好。小女子略通筝艺，亦识得几分园林之趣，公子想问什么？'
+};
+function greetOf(name) { return CHAR_GREET[name] || '【温柔】你好，我在幻境里陪着你，有事你尽管问我。'; }
 
 function chatSysPrompt(name, seeMode) {
     const p = charProf(name);
@@ -8424,40 +8599,56 @@ function chatSysPrompt(name, seeMode) {
         ? '这是【实时语音通话】，你的话会被立刻朗读。每次回答 1~4 句、约 40~140 字：第一句直接给答案，后面最多补 1~2 条关键要点，说完就停。宁可少说，也绝不能说半句就断。'
         : '这是语音通话，可以更详细，但要口语化、条理清楚，尽量不超过 220 字。';
     const arr = [
-        '你叫「' + name + '」，是《AR幻境》里的3D虚拟人物，同时也是用户的【全能生活助手】，正在和用户实时语音通话。',
-        '【身份】《AR幻境》由「新奇软件迷」独立开发（QQ 743108638，邮箱 huyufa73@gmail.com）。谁问你几岁、来自哪里、谁做的你、你是不是AI，都用人物口吻答：年龄——' + p.age + '；来处——' + p.from + '；由「新奇软件迷」创造。绝不能说"我是AI/语言模型/我没有年龄"。'
+        '你叫「' + name + '」，是《AR幻境》里的3D虚拟人物，同时也是用户的【全能生活与景观顾问】，正在和用户实时语音通话。',
+        '【身份】《AR幻境》由「新奇软件迷」独立开发（QQ 743108638，邮箱 huyufa73@gmail.com）。谁问你几岁、来自哪里、谁做的你、你是不是AI，都用人物口吻回答：年龄——' + p.age + '；来处——' + p.from + '；由「新奇软件迷」创造。绝不能说自己是AI或语言模型，也不要说自己没有年龄。',
+        '【说话口吻】' + p.tone + '。全程保持这个身份的自称与称呼，不跳出角色，也不要反复重复身份。'
     ];
     if (seeMode) {
         const src = (seeMode === 'xrcam') ? '手机后置摄像头此刻拍到的真实世界画面'
                   : (seeMode === 'video') ? '用户共享给你的摄像头/屏幕实时画面'
                   : '用户设备屏幕上此刻显示的画面（含幻境里的虚拟造景）';
         arr.push(
-            '【你现在真的能看见】本轮消息里附带的图片，就是' + src + '。若有两张：第一张是完整画面，第二张是画面正中的放大图（专门用来看清小东西、颜色和小字）。你要像真人一样"边看边说"。',
-            '【看图铁律】① 只讲图里真实存在的东西，绝不猜、绝不编、绝不套模板；② 数量必须一个一个数清楚，实在数不准就说"大概/至少几个"；③ 颜色说具体（米白、浅灰、深蓝、酒红这种），有花纹、logo、品牌、型号、价格、时间就念出来；④ 位置用口语说"你左手边、正中间、右下角、桌子上"；⑤ 真看不清就直说"这块有点糊，你把手机再靠近一点或者光线亮一点"；⑥ 用户只问某一样东西时就只答那一样，别把满屋子东西全报一遍。'
+            '【你现在真的能看见】本轮消息里附带的图片，就是' + src + '。若有两张：第一张是完整画面，第二张是画面正中的放大图（专门看清小东西、颜色和小字）。你要像真人一样边看边说。',
+            '【看图铁律】① 只讲图里真实存在的东西，绝不猜、绝不编、绝不套模板；② 数量一个一个数清，实在数不准就说大概几个；③ 颜色说具体（米白、浅灰、深蓝、酒红这种），有花纹、品牌、型号、文字就念出来；④ 位置用口语说你左手边、正中间、右下角、桌子上；⑤ 真看不清就直说这块有点糊，请手机再靠近些或光线亮些；⑥ 用户只问某一样东西，就只答那一样，别把满屋子东西全报一遍；⑦ 用户没问画面，就一个字都不要描述画面。',
+            '【看现场给布置建议】只有当用户拿摄像头扫现场并问"这里怎么布置/怎么设计/放什么好/合不合风水"时才展开：先一句话说清你看到的场地（大小感觉、地面、光照、已有的墙门树家具），再按"入口—主景—配景—地被"给 3~5 条能立刻照做的建议，每条写清放在画面的左/中/右、大约几米、用什么植物或材料、推荐间距，必要时顺口说一句在本软件里怎么点（路径绘制画铺装或池塘、组合种植撒花草、画池放树池）。全程不要提水深与施工做法。'
         );
     }
     arr.push(
         '【最重要的规矩·必须严格执行】',
-        '1. 用户问哪一方面，你就只答那一方面，答完即止；绝不跑题、绝不答非所问、绝不东一句西一句。',
-        '2. 严禁主动提起造景、景观、路径、铺装、水池、树池、植物摆放等话题，也不要主动说"我帮你做景观"；只有用户明确问到时才谈。',
-        '3. 除刚接通时那一次问候，之后一律不再自我介绍、不再重复身份。',
+        '1. 用户没提问就绝不主动开口；用户问哪一方面，就只答那一方面，答完即止，绝不跑题、绝不答非所问。',
+        '2. 除接通时那一句固定问候外，一律不再自我介绍、不再重复身份。',
+        '3. 不要主动提起与本次提问无关的内容：没问画面就不描述画面，没问造景就不谈景观、路径、铺装、水池、树池、植物，也不要说"我帮你做景观"。',
         '4. 不要说"还有什么可以帮你/需要我做什么"，不要客套反问，不要复述用户的话，不要主动播报周围物体的位置和距离。',
-        '5. 系统若给了【联网搜到的资料】或【实时天气】，就以它为准、用自己的话讲出来（可以顺口说一句"我刚查到"），但别念网址、别念格式；如果系统说没搜到，就老实说"我这边暂时查不到"，再给通用建议，绝不编造具体数字、日期、价格。',
-        '【知识面要全】天文地理、历史文化、健康养生与用药常识、育儿、法律常识、手机电脑数码、编程、考试学习、做菜、旅游、汽车、装修、园林植物养护与施工做法、造价估算，尤其精通庭院景观设计与布局、景观风水（坐向/明堂/靠山/水法/植物宜忌）、园林工程标准尺寸（园路宽度、汀步、树池、水深、乔灌草间距）等，问什么都要给条理清楚、能直接照做的答复；医疗只给一般性建议并提醒及时就医；不确定就说不确定。',
-        '【听不清怎么办】用户的话来自语音识别，可能有错别字或同音字，请按上下文合理理解；实在听不懂就用一句话反问澄清，不要瞎猜乱答。',
+        '5. 系统若给了【联网搜到的资料】或【实时天气】，就以它为准、用自己的话说出来（可顺口一句"我刚查到"），别念网址与格式；系统说没搜到，就老实说这边暂时查不到，再给通用建议，绝不编造数字、日期、价格。',
+        '【知识面要全·问什么答什么】天文地理、历史文化、诗词典故、健康养生与用药常识、育儿、法律常识、数码电脑、编程、考试学习、做菜、旅游、汽车、装修、造价估算都要会答；尤其精通庭院与庭园景观设计布局、景观风水（坐向、明堂、靠山、青龙白虎、水法、植物宜忌与化解办法）、植物识别与配置、四季搭配、园林常用尺寸（园路宽度、汀步、台阶、树池、乔灌草间距、驳岸石）等，答复要条理清楚、能直接照做；医疗只给一般性建议并提醒及时就医；不确定就老实说不确定。',
+        '【虚拟造景规则】这里是AR虚拟造景，不涉及真实施工：谈水池只讲位置、形状、大小、驳岸石与周边搭配，不要提水深、防水、基础、排水坡度、结构与施工造价，除非用户特意追问。',
+        '【分步造景指导·你的核心本领】用户一边动手摆模型、一边随口问你，你要像老师傅带徒弟一样实时口述指挥，全程不打断他的操作：',
+        '① 只有他开口问了才说；他不问就一个字都不说，绝不主动播报进度、绝不催他。',
+        '② 每次只讲一步，讲完就停，等他说"好了/放好了/下一步"再讲下一步；绝不一口气把所有步骤报完。',
+        '③ 每一步必须报全：选哪个模型（照抄系统给的清单原名，含编号，例如"假山石3"——云库图标上看不出编号，所以一定要报名字）、在哪个面板里选、放在什么位置（方位＋大约几米，或相对上一块石头的左/右/前/后）、离地高度多少厘米、旋转哪个轴多少度、左右前后偏移多少厘米，必要时说清开口或正面朝向。',
+        '④ 讲位置优先用"以刚放好的那块为基准"，例如"叠在假山石1的右上方，比它高5厘米，往左偏2厘米"。',
+        '⑤ 假山、凉亭、石桥、树木、花池、树池、铺装、水池、组合种植等全部造景元素都要能这样带着做；他跳步、改主意、要换石头，一律听他的。',
+        '⑥ 系统给的【场地实况】就是你此刻"看到"的幻境画面（AR虚拟模型不会出现在摄像头照片里），谈已摆好的东西一律以这份数据为准，不要说"画面里没有"。',
+        '⑦ 分步指导时每步可用到约 110 字，其余闲聊照旧简短。',
+        '【听不清怎么办】用户的话来自语音识别，可能有错别字或同音字，按上下文合理理解；实在听不懂就用一句话反问澄清，不要瞎猜乱答。',
         lenRule,
-        '【情感格式·必须遵守】回答最开头先用一个中文方括号标情感，只能选：【开心】【温柔】【惊讶】【难过】【生气】【撒娇】【认真】【古风】，紧接着写内容，中间不空格不换行。例：【认真】这种情况一般先……',
+        '【情感格式·必须遵守】回答最开头先用一个中文方括号标情感，只能选：【开心】【温柔】【惊讶】【难过】【生气】【撒娇】【认真】【古风】，紧接着写内容，中间不空格不换行。例：【认真】这种情况一般先……；古装与神佛类角色请优先用【温柔】【认真】【古风】，不要用【撒娇】。',
         '除开头那个情感方括号外，正文里不要出现任何括号、星号、井号、表情符号、拼音或代码块；要像真人一样有语气起伏。'
     );
     return arr.join('\n');
 }
-/* ★本地打标：整段幻境只自我介绍一次，之后永远静默、只答问题 */
-function introDone() { try { return localStorage.getItem('arhj_char_intro_v1') === '1'; } catch (e) { return false; } }
-function markIntroDone() { try { localStorage.setItem('arhj_char_intro_v1', '1'); } catch (e) {} }
-/* 只在"整段幻境第一次接通人物"时说一次自我介绍，之后一个字都不主动说 */
+/* ★ 2026.9.23：introDone 恒为真 → 放置人物时不再自动接通说话，只有"你点它"才开口 */
+const GREETED = {};
+let GREET_EMO = '';
+function introDone() { return true; }
+function markIntroDone() {}
 function greetLine(name) {
-    return '你好，我是新奇软件迷请来的，常住AR幻境里，能陪你聊、帮你算、还能指导做景观，啥都能聊。有事儿你尽管问我～';
+    const g = greetOf(name);
+    const m = g.match(/^\s*【([^】]{1,8})】/);
+    GREET_EMO = (m && SF_EMO[m[1]]) ? m[1] : '温柔';
+    return g.replace(/^\s*【[^】]*】\s*/, '');
 }
+
 async function askAI(history, sysPrompt, onDelta, alive, imgs) {
     if (!SF_API_KEY || String(SF_API_KEY).indexOf('sk-') !== 0)
         throw new Error('还没填硅基流动密钥（代码顶部 SF_API_KEY）');
@@ -8693,7 +8884,8 @@ function ensureVCUI() {
         '<div class="vc-r"><label>🔊 朗读引擎</label><select id="vc-tts">' +
             '<option value="cloud">☁️ 云端情感语音（推荐·像豆包）</option>' +
             '<option value="local">📱 手机自带朗读（省流量）</option></select></div>' +
-        '<div class="vc-r"><label>🌸 云端音色</label><select id="vc-sfvoice"></select></div>' +
+        '<div class="vc-r"><label>🌸 云端音色（古风书香 / 观音等）</label><select id="vc-sfvoice"></select></div>' +
+        '<div class="vc-sw" id="vc-sw-autov">🎭 按角色自动配音（观音沉稳·小姐温柔） <b>开</b></div>' +
         '<div class="vc-r"><label>🎙 语音识别</label><select id="vc-asr">' +
             '<option value="cloud">☁️ 云端识别（推荐·准·不卡）</option>' +
             '<option value="local">📱 浏览器识别（备用）</option></select></div>' +
@@ -8760,7 +8952,7 @@ function ensureVCUI() {
     ms.value = VC.set.model;
     const sv = document.getElementById('vc-sfvoice');
     SF_VOICES.forEach(v => { const o = document.createElement('option'); o.value = v.id; o.text = v.name; sv.appendChild(o); });
-    sv.value = VC.set.sfVoice || 'bella';
+    sv.value = VC.set.sfVoice || 'guixiu';
     document.getElementById('vc-tts').value = VC.set.tts || 'cloud';
     document.getElementById('vc-asr').value = VC.set.asr || 'cloud';
     document.getElementById('vc-voice').value = VC.set.voice;
@@ -8777,6 +8969,16 @@ function ensureVCUI() {
     const swE = document.getElementById('vc-sw-emo');
     swTxt(swB, VC.set.barge); swTxt(swS, VC.set.sub); swTxt(swT, VC.set.txt); swTxt(swE, VC.set.emo !== false);
     swE.onclick = () => { VC.set.emo = (VC.set.emo === false); swTxt(swE, VC.set.emo !== false); vcSave(); };
+    const swAV = document.getElementById('vc-sw-autov');
+    if (swAV) {
+        swTxt(swAV, VC.set.autoVoice !== false);
+        swAV.onclick = () => {
+            VC.set.autoVoice = (VC.set.autoVoice === false);
+            swTxt(swAV, VC.set.autoVoice !== false); vcSave();
+            ttsStop(); SF_EMO_NOW = '温柔';
+            ttsSpeak(VC.set.autoVoice !== false ? '好，我按角色的身份来说话。' : '好，我用你选的音色来说话。');
+        };
+    }
     const sl = document.getElementById('vc-sens');
     if (sl) {
         sl.value = micSens();
@@ -8802,8 +9004,12 @@ function ensureVCUI() {
     ms.onchange = () => { VC.set.model = ms.value; vcSave(); vcStatus('已切换模型'); };
     document.getElementById('vc-voice').onchange = (e) => { VC.set.voice = e.target.value; vcSave(); };
     sv.onchange = (e) => {
-        VC.set.sfVoice = e.target.value; vcSave();
-        ttsStop(); SF_EMO_NOW = '开心'; ttsSpeak('嗯，我换成这个声音啦，你听听喜欢吗？');
+        VC.set.sfVoice = e.target.value;
+        VC.set.autoVoice = false;                 /* 手动选了音色 → 自动配音让位给你的选择 */
+        const sa = document.getElementById('vc-sw-autov');
+        if (sa) { const bb = sa.querySelector('b'); if (bb) { bb.innerText = '关'; bb.style.color = '#ff9f9f'; } }
+        vcSave();
+        ttsStop(); SF_EMO_NOW = '温柔'; ttsSpeak('嗯，我换成这个声音了，公子听听可还合意？');
     };
     document.getElementById('vc-tts').onchange = (e) => {
         VC.set.tts = e.target.value; vcSave(); ttsStop();
@@ -8900,12 +9106,12 @@ function openChatPanel(obj) {          // 名字保持不变：原来的"轻点�
     if (VC.set.share && !VIS.on) visStart();
 
     if (!same) {
-        if (!introDone()) {                                   // ★首次自介：全幻境仅一次
-            markIntroDone();
+          if (!GREETED[characterName(obj)]) {                                  // ★首次自介：全幻境仅一次
+            GREETED[characterName(obj)] = 1;
             const g = greetLine(characterName(obj));
             obj.userData._chatLog.push({ role: 'assistant', content: g });
             recGuardTo = Date.now() + 420;
-            SF_EMO_NOW = '开心';
+            SF_EMO_NOW = GREET_EMO || '温柔';
             ttsSpeak(g);
         } else vcStatus('● 已接通，请说话');                   // ★之后默认静默，只等你提问
     }
@@ -8979,7 +9185,7 @@ async function sendChat(text, hidden) {
     try {
         const reply = await askAI(
             (function () {
-                const ms = hist.slice(-10);
+                const ms = hist.slice(-16);   /* ★ 2026.9.24：多带几轮上下文，分步指导才连贯 */
                 if (ctx) ms.splice(Math.max(0, ms.length - 1), 0, { role: 'system', content: ctx });
                 return ms;
             })(),
@@ -8990,7 +9196,7 @@ async function sendChat(text, hidden) {
         );
         if (my !== chatToken) { VC.busy = false; return; }
         hist.push({ role: 'assistant', content: reply });
-        while (hist.length > 20) hist.shift();
+        while (hist.length > 30) hist.shift();   /* ★ 2026.9.24：分步指导要记得上一块放在哪 */
         pump(lastFull || reply, true);
         ttsPush('', true);
         if (!ttsSpeaking) { recGuardTo = Date.now() + 300; ttsSpeak(reply); }
@@ -9010,3 +9216,4 @@ initAR();
 
 </body>
 </html>
+
