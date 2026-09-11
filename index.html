@@ -722,6 +722,8 @@ const ASSETS = {
     ],
     object: [
         
+        { id: 'vchar_GuiFuRen', name: '贵夫人·视频', icon: '🎬' },
+        { id: 'vchar_GuiFuRen', name: '贵夫人·视频', icon: '🎬' },
         { id: 'lily_white_pink', name: '写实睡莲·白粉', icon: '🪷' },
         { id: 'lily_purple',     name: '写实睡莲·紫',   icon: '💜' },
         { id: 'lily_rose',       name: '写实睡莲·粉',   icon: '🌸' },
@@ -738,6 +740,415 @@ const ASSETS = {
     ]
 };
 let currentAsset = ASSETS.path[0];
+
+/* ==========================================================================
+   ★★★ 2026.10 新增：视频人物（蓝幕/绿幕自动抠像 · 永远正对用户 · 口型随语音）★★★
+   · 视频放在仓库 ARHJYY/Videos/Gui Fu Ren/ 下，文件名会自动试探，不必改名
+   · 抠像全在 GPU 里做 → 人物之外完全透明，无白边、无蓝边
+   · 她永远只绕 Y 轴转向用户：你走到任何角度都看不到"纸片侧面"
+   · 说话时视频按语音响度自动加减速 → 口型开合跟着问答节奏；不说话时定格
+   · 轻点她 = 直接接通原有 AI 语音通话（与 3D 人物完全一致，AI 功能一个字没改）
+   ── 现场微调（浏览器控制台随时敲，立即生效）──────────────────────
+       vcharTune({ height:1.75 })            // 身高（米）
+       vcharTune({ sim:0.26, smooth:0.20 })  // 抠像强度 / 边缘柔和度
+       vcharTune({ spill:0.85 })             // 去蓝边（皮肤或头发发蓝就调大）
+       vcharTune({ idleRate:0.3 })           // 不说话时也轻微活动（0=定格）
+       vcharTune({ idleTime:0.4 })           // 定格在第几秒（挑一个闭嘴的帧）
+       vcharTune({ crop:[0.12,0,0.88,1] })   // 裁掉画面左右空白 [左,下,右,上]
+       vcharTune({ opacity:0.95 })           // 整体透明度
+       setVideoCharURL('https://…/xxx.mp4')  // 自动找不到时手填网址
+       vcharDiag()                           // 体检：打印哪些网址能下载
+   ========================================================================== */
+const VCHAR_BASES = [
+    'https://huyufa73.github.io/ARHJYY/',
+    'https://cdn.jsdelivr.net/gh/huyufa73/ARHJYY@main/',
+    'https://fastly.jsdelivr.net/gh/huyufa73/ARHJYY@main/',
+    'https://gcore.jsdelivr.net/gh/huyufa73/ARHJYY@main/',
+    'https://media.githubusercontent.com/media/huyufa73/ARHJYY/main/',
+    'https://raw.githubusercontent.com/huyufa73/ARHJYY/main/'
+];
+/* 想再加视频人物：照抄一行改 id / name / file 即可，其它代码一个字都不用动 */
+const VIDEO_CHARS = [
+    { id: 'vchar_GuiFuRen', cat: 'cat_renwu', name: '贵夫人·视频', icon: '🎬',
+      file: 'Videos/Gui Fu Ren/Gui Fu Ren.mp4', isVideo: true, realHeight: 1.68 }
+];
+VIDEO_CHARS.forEach(v => { if (!CLOUD_MODELS.some(m => m.id === v.id)) CLOUD_MODELS.push(v); });
+
+const VCHAR_TUNE = { height: 1.68, sim: 0.22, smooth: 0.16, spill: 0.65, opacity: 1.0,
+                     idleRate: 0, idleTime: 0, crop: null, key: null, yawFix: 0 };
+const VCHAR_CACHE = {};
+let VCHAR_LIST = [];
+let VCHAR_URL_FIX = '';
+let _vcLightEl = null;
+const _vcCamPos = new THREE.Vector3(), _vcObjPos = new THREE.Vector3();
+
+/* ---------- ① 文件名/网址自动试探 ---------- */
+function vcharFiles(file) {
+    const out = [];
+    const push = s => { if (s && out.indexOf(s) < 0) out.push(s); };
+    const i = file.lastIndexOf('/');
+    const dir = file.slice(0, i + 1), nm = file.slice(i + 1);
+    const stem = nm.replace(/\.[^.]+$/, '');
+    const dirs = [dir, dir.replace(/ /g, '_'), dir.replace(/ /g, ''),
+                  dir.toLowerCase(), dir.replace(/ /g, '').toLowerCase()];
+    const stems = [stem, stem.replace(/ /g, '_'), stem.replace(/ /g, ''),
+                   stem.toLowerCase(), stem.replace(/ /g, '').toLowerCase(), '贵夫人'];
+    const exts = ['.mp4', '.MP4', '.webm', '.mov'];
+    dirs.forEach(d => stems.forEach(s => exts.forEach(e => push(d + s + e))));
+    return out;
+}
+async function vcharProbe(urls, batch) {
+    for (let i = 0; i < urls.length; i += (batch || 8)) {
+        const part = urls.slice(i, i + (batch || 8));
+        const res = await Promise.all(part.map(async u => {
+            const ctl = new AbortController();
+            const to = setTimeout(() => { try { ctl.abort(); } catch (e) {} }, 5000);
+            try {
+                const r = await fetch(u, { method: 'HEAD', signal: ctl.signal });
+                clearTimeout(to);
+                return r.ok ? u : '';
+            } catch (e) { clearTimeout(to); return ''; }
+        }));
+        for (let k = 0; k < res.length; k++) if (res[k]) return res[k];
+    }
+    return '';
+}
+async function vcharFindURL(asset) {
+    if (VCHAR_URL_FIX) return VCHAR_URL_FIX;
+    if (asset._vurl) return asset._vurl;
+    const files = vcharFiles(asset.file);
+    for (let b = 0; b < VCHAR_BASES.length; b++) {
+        const list = files.map(f => VCHAR_BASES[b] + encodeURI(f));
+        const hit = await vcharProbe(list, 8);
+        if (hit) { asset._vurl = hit; return hit; }
+    }
+    return '';
+}
+
+/* ---------- ② 抠像着色器（归一化色度键：亮部暗部同一套阈值，不产生蓝边） ---------- */
+function _vcCbCr(r, g, b) {
+    const y = 0.299 * r + 0.587 * g + 0.114 * b;
+    return [0.5643 * (b - y), 0.7133 * (r - y)];
+}
+function _vcKeyCC(k) {
+    const m = Math.max(0.02, Math.max(k[0], Math.max(k[1], k[2])));
+    return _vcCbCr(k[0] / m, k[1] / m, k[2] / m);
+}
+function vcharShadowTex() {
+    return getCached('vchar_shadow_tex', () => {
+        const cv = document.createElement('canvas'); cv.width = cv.height = 128;
+        const cx = cv.getContext('2d');
+        const g = cx.createRadialGradient(64, 64, 2, 64, 64, 62);
+        g.addColorStop(0, 'rgba(0,0,0,0.42)');
+        g.addColorStop(0.55, 'rgba(0,0,0,0.16)');
+        g.addColorStop(1, 'rgba(0,0,0,0)');
+        cx.fillStyle = g; cx.fillRect(0, 0, 128, 128);
+        return new THREE.CanvasTexture(cv);
+    });
+}
+function vcharMat(box) {
+    const k = (box && box.key) || VCHAR_TUNE.key || [0.06, 0.30, 0.85];
+    const cc = _vcKeyCC(k);
+    return new THREE.ShaderMaterial({
+        uniforms: {
+            uMap:     { value: box.tex },
+            uKey:     { value: new THREE.Vector3(k[0], k[1], k[2]) },
+            uKeyCC:   { value: new THREE.Vector2(cc[0], cc[1]) },
+            uSim:     { value: VCHAR_TUNE.sim },
+            uSmooth:  { value: VCHAR_TUNE.smooth },
+            uSpill:   { value: VCHAR_TUNE.spill },
+            uOpacity: { value: VCHAR_TUNE.opacity },
+            uBright:  { value: 1.0 },
+            uUvA:     { value: new THREE.Vector2(0, 0) },
+            uUvB:     { value: new THREE.Vector2(1, 1) }
+        },
+        vertexShader: `
+            uniform vec2 uUvA, uUvB;
+            varying vec2 vUv;
+            void main(){
+                vUv = mix(uUvA, uUvB, uv);
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+            }`,
+        fragmentShader: `
+            uniform sampler2D uMap;
+            uniform vec3  uKey;
+            uniform vec2  uKeyCC;
+            uniform float uSim, uSmooth, uSpill, uOpacity, uBright;
+            varying vec2 vUv;
+            vec2 cbcr(vec3 c){
+                float y = dot(c, vec3(0.299, 0.587, 0.114));
+                return vec2(0.5643 * (c.b - y), 0.7133 * (c.r - y));
+            }
+            void main(){
+                vec4 t  = texture2D(uMap, vUv);
+                vec3 c  = t.rgb;
+                vec3 cn = c / max(0.02, max(c.r, max(c.g, c.b)));
+                float d = distance(cbcr(cn), uKeyCC);
+                float a = smoothstep(uSim, uSim + max(uSmooth, 0.002), d);
+                if (uKey.b >= uKey.g) {
+                    float sp = max(0.0, c.b - max(c.r, c.g));
+                    c.b -= sp * uSpill;
+                    c.g += sp * uSpill * 0.18;
+                } else {
+                    float sp = max(0.0, c.g - max(c.r, c.b));
+                    c.g -= sp * uSpill;
+                }
+                c *= mix(0.88, 1.0, a);
+                float al = a * t.a * uOpacity;
+                if (al < 0.10) discard;
+                gl_FragColor = vec4(clamp(c * uBright, 0.0, 1.0), al);
+            }`,
+        transparent: true, side: THREE.DoubleSide, depthWrite: true, depthTest: true
+    });
+}
+
+/* ---------- ③ 自动识别幕布颜色（取画面四角，蓝幕/绿幕都认） ---------- */
+function vcharAutoKey(box) {
+    try {
+        const v = box.video;
+        if (!v || !v.videoWidth) return;
+        const W = 48, H = 48;
+        if (!box.kcv) { box.kcv = document.createElement('canvas'); box.kctx = box.kcv.getContext('2d', { willReadFrequently: true }); }
+        box.kcv.width = W; box.kcv.height = H;
+        box.kctx.drawImage(v, 0, 0, W, H);
+        const d = box.kctx.getImageData(0, 0, W, H).data;
+        let r = 0, g = 0, b = 0, n = 0;
+        const take = (x0, y0) => {
+            for (let y = y0; y < y0 + 8; y++) for (let x = x0; x < x0 + 8; x++) {
+                const i = (y * W + x) * 4; r += d[i]; g += d[i + 1]; b += d[i + 2]; n++;
+            }
+        };
+        take(0, 0); take(W - 8, 0); take(0, H - 8); take(W - 8, H - 8); take(20, 0);
+        if (!n) return;
+        r /= n * 255; g /= n * 255; b /= n * 255;
+        const mx = Math.max(r, Math.max(g, b)), mn = Math.min(r, Math.min(g, b));
+        if (mx > 0.10 && (mx - mn) > 0.10) { box.key = [r, g, b]; vcharApplyAll(false); }
+    } catch (e) {}
+}
+
+/* ---------- ④ 加载视频（同一个人物全场共用一份，手机不吃力） ---------- */
+function vcharGet(id, cb) {
+    const c = VCHAR_CACHE[id];
+    if (c && c.ready) { cb(c); return; }
+    if (c && c.waits) { c.waits.push(cb); return; }
+    const asset = CLOUD_MODELS.find(a => a.id === id);
+    if (!asset) return;
+    const box = { waits: [cb], ready: false, rate: 0, fresh: 0 };
+    VCHAR_CACHE[id] = box;
+    const toast = document.getElementById('loading-toast');
+    toast.style.display = 'block';
+    toast.innerText = '正在载入视频人物：' + asset.name + '…';
+    (async () => {
+        const url = await vcharFindURL(asset);
+        if (!url) {
+            delete VCHAR_CACHE[id];
+            toast.style.maxWidth = '90vw'; toast.style.whiteSpace = 'pre-wrap';
+            toast.innerText = '❌ 没找到视频文件\n请确认 ARHJYY/Videos/Gui Fu Ren/ 里有 mp4\n或在控制台敲 vcharDiag() 体检';
+            setTimeout(() => { toast.style.display = 'none'; }, 12000);
+            return;
+        }
+        const v = document.createElement('video');
+        v.crossOrigin = 'anonymous';
+        v.loop = true; v.muted = true; v.defaultMuted = true; v.volume = 0;
+        v.playsInline = true; v.preload = 'auto';
+        v.setAttribute('playsinline', ''); v.setAttribute('webkit-playsinline', ''); v.setAttribute('muted', '');
+        v.style.cssText = 'position:fixed;left:0;bottom:0;width:2px;height:2px;opacity:0.01;pointer-events:none;z-index:-1;';
+        document.body.appendChild(v);
+        v.src = url;
+        const done = () => {
+            if (box.ready) return;
+            if (!v.videoWidth) return;
+            box.ready = true;
+            box.video = v;
+            box.aspect = v.videoWidth / v.videoHeight;
+            const tex = new THREE.Texture(v);          /* 手动控制上传：暂停时零开销 */
+            tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter;
+            tex.generateMipmaps = false;
+            tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+            tex.needsUpdate = true;
+            box.tex = tex; box.fresh = 12;
+            toast.style.display = 'none';
+            const w = box.waits || []; box.waits = null;
+            w.forEach(f => { try { f(box); } catch (e) {} });
+            setTimeout(() => vcharAutoKey(box), 350);
+        };
+        v.addEventListener('loadeddata', done);
+        v.addEventListener('canplay', done);
+        v.addEventListener('error', () => {
+            if (box.ready) return;
+            delete VCHAR_CACHE[id];
+            toast.style.maxWidth = '90vw'; toast.style.whiteSpace = 'pre-wrap';
+            toast.innerText = '❌ 视频加载失败\n' + url + '\n（建议 H.264 编码、20MB 以内）';
+            setTimeout(() => { toast.style.display = 'none'; }, 12000);
+        });
+        try { const p = v.play(); if (p && p.catch) p.catch(() => {}); } catch (e) {}
+        setTimeout(done, 2500);
+    })();
+}
+
+/* ---------- ⑤ 建人物（面片 + 脚下柔和阴影 + 隐形点选盒） ---------- */
+function vcharApplyGeom(o) {
+    const box = VCHAR_CACHE[o.userData.vcharId];
+    if (!box || !box.ready) return;
+    const m = o.userData.vcMesh;
+    if (!m || !m.material || !m.material.uniforms) return;
+    const cr = VCHAR_TUNE.crop || [0, 0, 1, 1];
+    const du = Math.max(0.05, cr[2] - cr[0]), dv = Math.max(0.05, cr[3] - cr[1]);
+    const h = Math.max(0.2, VCHAR_TUNE.height || 1.68);
+    const w = Math.max(0.05, h * (box.aspect || 0.5625) * (du / dv));
+    try { if (m.geometry) m.geometry.dispose(); } catch (e) {}
+    const g = new THREE.PlaneGeometry(w, h, 1, 1);
+    g.translate(0, h / 2, 0);
+    m.geometry = g;
+    m.material.uniforms.uUvA.value.set(cr[0], cr[1]);
+    m.material.uniforms.uUvB.value.set(cr[2], cr[3]);
+    if (o.userData.vcShadow) o.userData.vcShadow.scale.set(w * 0.86, w * 0.52, 1);
+    const olds = [];
+    o.traverse(c => { if (c.userData && c.userData.isHitbox) olds.push(c); });
+    olds.forEach(c => { if (c.parent) c.parent.remove(c); });
+    o.userData._pickBoxDone = 0;
+    addPickBox(o, false);
+    if (selectedObj === o) {
+        const hp = o.getObjectByName('helper');
+        if (hp) o.remove(hp);
+        selectedObj = null; selectObject(o);
+    }
+}
+function vcharApplyAll(geomToo) {
+    for (let i = 0; i < VCHAR_LIST.length; i++) {
+        const o = VCHAR_LIST[i];
+        const box = VCHAR_CACHE[o.userData.vcharId];
+        const m = o.userData.vcMesh;
+        if (!m || !m.material || !m.material.uniforms) continue;
+        const k = (box && box.key) || VCHAR_TUNE.key || [0.06, 0.30, 0.85];
+        const cc = _vcKeyCC(k);
+        const u = m.material.uniforms;
+        u.uKey.value.set(k[0], k[1], k[2]);
+        u.uKeyCC.value.set(cc[0], cc[1]);
+        u.uSim.value = VCHAR_TUNE.sim;
+        u.uSmooth.value = VCHAR_TUNE.smooth;
+        u.uSpill.value = VCHAR_TUNE.spill;
+        u.uOpacity.value = VCHAR_TUNE.opacity;
+        if (geomToo) vcharApplyGeom(o);
+    }
+}
+function vcharBuild(id, box) {
+    const g = new THREE.Group();
+    const mesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), vcharMat(box));
+    mesh.frustumCulled = false; mesh.renderOrder = 14;
+    g.add(mesh);
+    g.userData.isModel = true;
+    g.userData.id = id;
+    g.userData.vcharId = id;
+    g.userData.isVideoChar = true;
+    g.userData.vcMesh = mesh;
+    g.userData.baseScale = [1, 1, 1];
+    const sh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1),
+        new THREE.MeshBasicMaterial({ map: vcharShadowTex(), transparent: true, depthWrite: false }));
+    sh.rotation.x = -Math.PI / 2; sh.position.y = 0.008;
+    sh.raycast = function () {}; sh.renderOrder = 8;
+    g.add(sh); g.userData.vcShadow = sh;
+    vcharApplyGeom(g);
+    VCHAR_LIST.push(g);
+    return g;
+}
+function placeVideoChar(id, pos) {
+    const asset = CLOUD_MODELS.find(a => a.id === id) || {};
+    vcharGet(id, (box) => {
+        const g = vcharBuild(id, box);
+        g.position.set(pos.x, (pos.y != null ? pos.y : groundLevel), pos.z);
+        scene.add(g);
+        placedObjects.push(g);
+        vcharFaceUser(g);
+        selectObject(g);
+        showSysToast('🎬 ' + (asset.name || '视频人物') + ' 已就位：轻点她即可语音聊天');
+    });
+}
+
+/* ---------- ⑥ 每帧：永远正对用户 + 口型随语音快慢 ---------- */
+function vcharFaceUser(o) {
+    try {
+        const cam = getRayCamera();
+        _vcCamPos.setFromMatrixPosition(cam.matrixWorld);
+        o.getWorldPosition(_vcObjPos);
+        const dx = _vcCamPos.x - _vcObjPos.x, dz = _vcCamPos.z - _vcObjPos.z;
+        if (dx * dx + dz * dz < 1e-8) return;
+        o.rotation.set(0, Math.atan2(dx, dz) + (VCHAR_TUNE.yawFix || 0), 0);
+    } catch (e) {}
+}
+function updateVideoChars(t) {
+    if (!VCHAR_LIST.length) return;
+    if (!_vcLightEl) _vcLightEl = document.getElementById('light-intensity');
+    const br = _vcLightEl ? Math.max(0.40, Math.min(1.55, parseFloat(_vcLightEl.value) || 1)) : 1;
+    const need = {};
+    for (let i = VCHAR_LIST.length - 1; i >= 0; i--) {
+        const o = VCHAR_LIST[i];
+        if (!o.parent) { VCHAR_LIST.splice(i, 1); continue; }
+        vcharFaceUser(o);
+        const m = o.userData.vcMesh;
+        if (m && m.material && m.material.uniforms) m.material.uniforms.uBright.value = br;
+        const id = o.userData.vcharId;
+        let rate = VCHAR_TUNE.idleRate || 0;
+        let talking = false;
+        try { talking = (chatTarget === o) && (ttsSpeaking || TALK.on); } catch (e) {}
+        if (talking) {
+            let lv = 0;
+            try { lv = (SFV && SFV.level) ? SFV.level : 0; } catch (e) {}
+            rate = (lv > 0.005) ? Math.max(0.45, Math.min(2.2, 0.45 + lv * 2.6))
+                                : (1.0 + Math.sin(t * 6.0) * 0.22);
+        }
+        if (!(id in need) || rate > need[id]) need[id] = rate;
+    }
+    for (const k in need) {
+        const box = VCHAR_CACHE[k];
+        if (!box || !box.ready || !box.video) continue;
+        const v = box.video, want = need[k];
+        box.rate = (box.rate == null) ? want : (box.rate + (want - box.rate) * 0.30);
+        if (want <= 0.02) {
+            if (!v.paused) {
+                try { v.pause(); } catch (e) {}
+                if (VCHAR_TUNE.idleTime != null) { try { v.currentTime = VCHAR_TUNE.idleTime; } catch (e) {} }
+                box.fresh = 10;
+            }
+            box.rate = 0;
+        } else {
+            try { v.playbackRate = Math.max(0.10, Math.min(3.0, Math.max(box.rate, 0.20))); } catch (e) {}
+            if (v.paused) { const p = v.play(); if (p && p.catch) p.catch(() => {}); }
+        }
+        if (box.tex) {
+            if (!v.paused && v.readyState >= 2) box.tex.needsUpdate = true;
+            else if (box.fresh > 0) { box.fresh--; box.tex.needsUpdate = true; }
+        }
+    }
+}
+/* 借用已有的每帧遍历当驱动，loop() 一行都不用改 */
+animatedTrees.push({ uniforms: { uTime: { get value() { return 0; },
+    set value(t) { try { updateVideoChars(t); } catch (e) {} } } } });
+
+/* ---------- ⑦ 调试 / 微调接口 ---------- */
+window.vcharTune = function (o) { Object.assign(VCHAR_TUNE, o || {}); vcharApplyAll(true); return VCHAR_TUNE; };
+window.setVideoCharURL = function (u) {
+    VCHAR_URL_FIX = u || '';
+    VIDEO_CHARS.forEach(v => { delete v._vurl; });
+    for (const k in VCHAR_CACHE) delete VCHAR_CACHE[k];
+    showSysToast(u ? '✅ 已指定视频网址，请重新放置人物' : '已清除指定网址');
+    return VCHAR_URL_FIX;
+};
+window.vcharDiag = async function () {
+    const a = CLOUD_MODELS.find(x => x.id === 'vchar_GuiFuRen');
+    const files = vcharFiles(a.file).slice(0, 24);
+    const out = [];
+    for (let b = 0; b < 2; b++) for (let i = 0; i < files.length; i++) {
+        const u = VCHAR_BASES[b] + encodeURI(files[i]);
+        try { const r = await fetch(u, { method: 'HEAD' }); out.push((r.ok ? '✅ ' : ('❌' + r.status + ' ')) + u); }
+        catch (e) { out.push('❌网络 ' + u); }
+    }
+    console.log(out.join('\n'));
+    showSysToast((out.find(x => x.indexOf('✅') === 0) || '全部失败，请看控制台').slice(0, 90));
+    return out;
+};
+/* ===================== 视频人物模块 结束 ===================== */
+
 const dracoLoader = new DRACOLoader();
 /* ★ 与 importmap 统一走 jsdelivr：unpkg 国内易超时，会让 Draco 压缩模型加载失败 */
 dracoLoader.setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/libs/draco/');
@@ -922,28 +1333,34 @@ function optimizeGroupRaycast(group, asset) {
     let hitH = Math.max(size.y, 0.05);
     let hitD = Math.max(size.z, 0.05);
     let hitCenterY = center.y;
-    const isTall = size.y > 1.2 && size.y > Math.max(size.x, size.z) * 1.2;
+   const isTall = size.y > 1.2 && size.y > Math.max(size.x, size.z) * 1.2;
     const _isTreeCat = !!(asset && asset.cat === 'cat_shumu');
     if (isTall && _isTreeCat) {
-        /* 树：只有树干附近能点中，方便在树冠下继续画线/摆件（★ 2026.9.24 再收窄） */
-        hitH = size.y * 0.26;
-        hitW = Math.max(size.x * 0.28, 0.05);
-        hitD = Math.max(size.z * 0.28, 0.05);
+        /* 树：树干+下部枝干可点，树冠下依旧能画线/摆件（★2026.10 放大到 0.36） */
+        hitH = size.y * 0.36;
+        hitW = Math.max(size.x * 0.34, 0.06);
+        hitD = Math.max(size.z * 0.34, 0.06);
         hitCenterY = box.min.y + hitH * 0.5;
     } else if (isTall) {
-        /* 人物 / 亭子等高瘦物体：高度仍好点，但左右明显收窄，避免误点（★ 2026.9.24） */
-        hitH = size.y * 0.88;
-        hitW = Math.max(size.x * 0.42, 0.07);
-        hitD = Math.max(size.z * 0.42, 0.07);
+        /* 人物 / 亭子等高瘦物体：整根身子都能点中 */
+        hitH = size.y * 0.92;
+        hitW = Math.max(size.x * 0.55, 0.07);
+        hitD = Math.max(size.z * 0.55, 0.07);
         hitCenterY = box.min.y + hitH * 0.5;
     } else {
-        /* ★ 2026.9.24：由 1:1 再内缩到 0.72，只有真正点在物体本体上才会选中 */
-        hitW = Math.max(size.x * 0.72, 0.05);
-        hitD = Math.max(size.z * 0.72, 0.05);
-        hitH = Math.max(size.y * 0.82, 0.05);
+        /* 一般物体：接近 1:1，指哪打哪 */
+        hitW = Math.max(size.x * 0.88, 0.05);
+        hitD = Math.max(size.z * 0.88, 0.05);
+        hitH = Math.max(size.y * 0.90, 0.05);
         hitCenterY = box.min.y + hitH * 0.5;
     }
-    const hitGeo = new THREE.BoxGeometry(Math.max(hitW, 0.035), Math.max(hitH, 0.035), Math.max(hitD, 0.035));
+    /* ★★ 2026.10 关键修复 ★★
+       hitW/hitH/hitD 是"已经含 group.scale 的世界尺寸"，而 hitMesh 是 group 的子物体，
+       渲染时会再乘一次 group.scale → 以前点选盒被缩到只剩 20%~50%，
+       这就是"多个模型时点不中 / 要点好几次 / 点到地面去了"的根源。先除掉 scale 再建盒。 */
+    const _sgx = Math.abs(group.scale.x) || 1, _sgy = Math.abs(group.scale.y) || 1, _sgz = Math.abs(group.scale.z) || 1;
+    const _lw = Math.max(hitW / _sgx, 0.02), _lh = Math.max(hitH / _sgy, 0.02), _ld = Math.max(hitD / _sgz, 0.02);
+    const hitGeo = new THREE.BoxGeometry(_lw, _lh, _ld);
     const hitMat = new THREE.MeshBasicMaterial({ visible: false });
     const hitMesh = new THREE.Mesh(hitGeo, hitMat);
     const localCenter = new THREE.Vector3(center.x, hitCenterY, center.z);
@@ -951,6 +1368,9 @@ function optimizeGroupRaycast(group, asset) {
     hitMesh.position.copy(localCenter);
     hitMesh.userData.isHitbox = true;
     group.add(hitMesh);
+    /* 本地坐标的点选盒尺寸：绿框和"像素补刀"都用它，才不会大小错位 */
+    group.userData.pickSize = [_lw, _lh, _ld];
+    group.userData.pickCenter = [localCenter.x, localCenter.y, localCenter.z]; 
     const matConvertCache = new WeakMap();
     const convertMat = (m) => {
         if (!m) return m;
@@ -3805,7 +4225,7 @@ function _isPersonType(type) {
     const m = CLOUD_MODELS.find(a => a.id === type);
     return !!(m && m.cat === 'cat_renwu');
 }
-/* ★★ 2026.9.21：场景内"人物"永远只允许存在 1 个，并且能铲掉删不掉的残留 ★★ */
+/* ★★ 2026.10：已改为"同场可放多个人物"，以下函数仅作工具保留，不再自动删除任何人物 ★★ */
 function isDescendantOf(o, root) {
     let p = o;
     while (p) { if (p === root) return true; p = p.parent; }
@@ -3845,24 +4265,9 @@ function pickKeepPerson(list) {
         if (placedObjects.indexOf(list[i]) >= 0) return list[i];
     return list[list.length - 1];
 }
-function enforceSinglePerson(keep) {
-    const list = collectAllCharacters();
-    if (list.length <= 1) return 0;
-    const target = (keep && list.indexOf(keep) >= 0) ? keep : pickKeepPerson(list);
-    let n = 0;
-    list.forEach(o => {
-        if (o === target || isDescendantOf(o, target) || isDescendantOf(target, o)) return;
-        try { killSceneObject(o); } catch (e) { try { if (o.parent) o.parent.remove(o); } catch (e2) {} }
-        n++;
-    });
-    if (n) { try { showSysToast('🧹 已自动清除多出的 ' + n + ' 个人物'); } catch (e) {} }
-    return n;
-}
-function _removeExistingPersons() {
-    collectAllCharacters().forEach(o => {
-        try { killSceneObject(o); } catch (e) { try { if (o.parent) o.parent.remove(o); } catch (e2) {} }
-    });
-}
+/* ★ 2026.10：允许同场多位人物共存 —— 这两个"只保留一个人物"的函数彻底停用，永不再删任何模型 */
+function enforceSinglePerson(keep) { return 0; }
+function _removeExistingPersons() { return 0; }
 /* ★修复①(兜底)：把人物贴图强制重新上传到当前GPU上下文，杜绝AR下发白/斑驳 */
 function _reuploadTextures(root) {
     if (!root) return;
@@ -3875,20 +4280,13 @@ function _reuploadTextures(root) {
 }
 
 function createObject(type, pos) {
-    if (Date.now() - CHAT_TAP_TS < 2500) return;   /* ★ 刚点过人物(说话/打断) → 2.5秒内绝不放置任何模型 */
-    pickedByTap = false;   /* ★ 2026.9.24：放置后自动选中的不算"手动点选" → 可连续点地面连续放 */
+    /* ★ 2026.10 修正：同一场景允许多个人物 + 任意模型共存，放置前后一律不删除已有人物 */
+    if (Date.now() - CHAT_TAP_TS < 600) return;   /* 刚点过人物(说话/打断) → 0.6秒内不误放模型 */
+    pickedByTap = false;   /* 放置后自动选中的不算"手动点选" → 可连续点地面连续放 */
+    if (type.indexOf('vchar_') === 0) { placeVideoChar(type, pos); return; }   /* ★ 视频人物 */
     if (type.startsWith('cloud_')) {
         const _person = _isPersonType(type);
-        /* ★ 唯一能"多出人物"的入口：通话中 / 刚点过人物时，场景已有人物就直接拒绝新增 */
-        if (_person && collectAllCharacters().length > 0 &&
-            (VC.on || Date.now() - CHAT_TAP_TS < 6000)) {
-            enforceSinglePerson(null);
-            showSysToast('👤 通话中不再新增人物（挂断后即可更换）');
-            return;
-        }
-        if (_person) _removeExistingPersons();   // ★放置前先销毁旧人物，场景永远只保留1个
         getCloudModel(type, (model) => {
-            if (_person) _removeExistingPersons();   // ★防止异步加载期间连点，二次清理旧人物
             model.userData.isModel = true;
             model.userData.id = type;
             const assetDef = CLOUD_MODELS.find(a => a.id === type);
@@ -3924,6 +4322,7 @@ function createObject(type, pos) {
     if (!type.startsWith('tree_') && type !== 'bamboo') { const box = new THREE.Box3().setFromObject(group); yOffset = -box.min.y; }
     group.position.set(pos.x, (pos.y || groundLevel) + yOffset, pos.z);
     if (isSwayPlantId(type)) registerSway(group, isTreeId(type));
+    addPickBox(group, isTreeId(type));   /* ★ 本地模型也有隐形点选盒 → 点得准、射线还更快 */
     scene.add(group);
     placedObjects.push(group);
     selectObject(group);
@@ -3939,9 +4338,11 @@ function selectObject(obj) {
     const texRotCtrl = document.getElementById('tex-rot-control'); const texRotSlider = document.getElementById('tex-rot-slider');
     if (obj && (obj.userData.isModel || obj.userData.isPaving)) {
         let helper;
-        if (obj.userData.bbSize && obj.userData.bbCenter) {
-            const [w, h, d] = obj.userData.bbSize;
-            const [cx, cy, cz] = obj.userData.bbCenter;
+        const _ps = obj.userData.pickSize || obj.userData.bbSize;
+        const _pc = obj.userData.pickCenter || obj.userData.bbCenter;
+        if (_ps && _pc) {
+            const [w, h, d] = _ps;
+            const [cx, cy, cz] = _pc;
             const boxGeo = new THREE.BoxGeometry(w, h, d);
             const edgeGeo = new THREE.EdgesGeometry(boxGeo);
             helper = new THREE.LineSegments(edgeGeo, new THREE.LineBasicMaterial({color: 0x2ecc71, depthTest: false}));
@@ -4101,7 +4502,6 @@ function sweepGhosts() {
         placedObjects.push(o);
         n++;
     });
-    try { enforceSinglePerson(null); } catch (e) {}   /* ★ 场景内永远只留 1 个人物 */
     return n;
 }
 /* ====== ★ 幽灵清理模块结束 ★ ====== */
@@ -4163,10 +4563,122 @@ function getGroundPointAtScreen(clientX, clientY) {
     if (raycaster.ray.intersectPlane(plane, hit)) return hit;
     return null;
 }
-function findInteractTarget(intersects) {
+/* ================= ★ 2026.10 全新点选内核：多模型密集摆放时"指哪打哪" ★ =================
+   ① 每个模型都有隐形点选盒（本地模型也补上了，见 addPickBox）
+   ② 射线擦边没打中 → 用"屏幕像素距离"再补一刀（±26 像素）
+   ③ 同一处连续点 → 在互相重叠的模型之间循环切换（带提示，几号/共几个）
+   想更灵敏就把下面 PICK_R 调大（如 34），想更严格就调小（如 18）                       */
+const PICK_R = 26;
+let PICK_CYC = { x: -9999, y: -9999, t: 0 };
+const _PK_V = new THREE.Vector3();
+
+function addPickBox(obj, isTree) {
+    if (!obj || obj.userData._pickBoxDone) return;
+    try {
+        obj.updateMatrixWorld(true);
+        const inv = new THREE.Matrix4().copy(obj.matrixWorld).invert();
+        const box = new THREE.Box3();
+        obj.traverse(c => {
+            if (!c.isMesh || c.userData.isHitbox || !c.geometry) return;
+            if (!c.geometry.boundingBox) c.geometry.computeBoundingBox();
+            if (!c.geometry.boundingBox) return;
+            box.union(c.geometry.boundingBox.clone()
+                .applyMatrix4(new THREE.Matrix4().multiplyMatrices(inv, c.matrixWorld)));
+        });
+        if (box.isEmpty()) return;
+        const size = box.getSize(new THREE.Vector3());
+        const ctr  = box.getCenter(new THREE.Vector3());
+        const tall = size.y > 1.2 && size.y > Math.max(size.x, size.z) * 1.2;
+        let w, h, d;
+        if (isTree && tall) { h = size.y * 0.36; w = Math.max(size.x * 0.34, 0.06); d = Math.max(size.z * 0.34, 0.06); }
+        else if (tall)      { h = size.y * 0.92; w = Math.max(size.x * 0.55, 0.07); d = Math.max(size.z * 0.55, 0.07); }
+        else                { h = Math.max(size.y * 0.90, 0.05); w = Math.max(size.x * 0.88, 0.05); d = Math.max(size.z * 0.88, 0.05); }
+        const cy = box.min.y + h * 0.5;
+        /* 关掉几百片草叶的射线 → 又快又准，只认这个盒子 */
+        obj.traverse(c => { if (c.isMesh && !c.userData.isHitbox) c.raycast = function () {}; });
+        const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), new THREE.MeshBasicMaterial({ visible: false }));
+        m.position.set(ctr.x, cy, ctr.z);
+        m.userData.isHitbox = true;
+        obj.add(m);
+        obj.userData._pickBoxDone = 1;
+        obj.userData.pickSize = [w, h, d];
+        obj.userData.pickCenter = [ctr.x, cy, ctr.z];
+        if (!obj.userData.bbSize) { obj.userData.bbSize = [w, h, d]; obj.userData.bbCenter = [ctr.x, cy, ctr.z]; }
+    } catch (e) {}
+}
+
+function pickName(o) {
+    if (!o || !o.userData) return '模型';
+    const ud = o.userData;
+    if (ud.isScatter) return '组合种植区';
+    if (ud.isPondWithEdge) return '叠石池塘';
+    if (ud.isCurbWithFill) return '路缘石铺装';
+    if (ud.isFence) return '石栏杆';
+    if (ud.isPathObj) return invName(ud.modelId) + '带';
+    if (ud.id === 'tree_pool') return '树池';
+    if (ud.isPaving) return invName(ud.assetId);
+    return invName(ud.id);
+}
+function camInvOf(cam) { return new THREE.Matrix4().copy(cam.matrixWorld).invert(); }
+function screenRectOf(obj, cam, camInv) {
+    const s = obj.userData.pickSize || obj.userData.bbSize;
+    const c = obj.userData.pickCenter || obj.userData.bbCenter;
+    if (!s || !c) return null;
+    const W = window.innerWidth, H = window.innerHeight;
+    let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9, ok = false;
+    for (let i = 0; i < 8; i++) {
+        _PK_V.set(c[0] + ((i & 1) ? 0.5 : -0.5) * s[0],
+                  c[1] + ((i & 2) ? 0.5 : -0.5) * s[1],
+                  c[2] + ((i & 4) ? 0.5 : -0.5) * s[2]);
+        obj.localToWorld(_PK_V);
+        _PK_V.applyMatrix4(camInv);
+        if (_PK_V.z > -0.05) continue;                 // 在相机后面
+        _PK_V.applyMatrix4(cam.projectionMatrix);
+        const px = (_PK_V.x * 0.5 + 0.5) * W, py = (-_PK_V.y * 0.5 + 0.5) * H;
+        ok = true;
+        if (px < x0) x0 = px; if (px > x1) x1 = px;
+        if (py < y0) y0 = py; if (py > y1) y1 = py;
+    }
+    return ok ? { x0: x0, y0: y0, x1: x1, y1: y1 } : null;
+}
+function rectDist(r, x, y) {
+    return Math.hypot(Math.max(r.x0 - x, 0, x - r.x1), Math.max(r.y0 - y, 0, y - r.y1));
+}
+function pickCandidates(cx, cy) {
+    const cam = getRayCamera();
+    const camInv = camInvOf(cam);
+    const camPos = new THREE.Vector3().setFromMatrixPosition(cam.matrixWorld);
+    mouse.x = (cx / window.innerWidth) * 2 - 1;
+    mouse.y = -(cy / window.innerHeight) * 2 + 1;
+    raycaster.setFromCamera(mouse, cam);
+    const hits = raycaster.intersectObjects(placedObjects, true);
+    const models = [], seen = new Set();
+    let paving = null;
+    for (let i = 0; i < hits.length; i++) {
+        let t = hits[i].object;
+        while (t.parent && !t.userData.isPaving && !t.userData.isModel) t = t.parent;
+        if (t.userData.isModel) {
+            if (!seen.has(t)) { seen.add(t); models.push({ obj: t, px: 0, cd: hits[i].distance }); }
+        } else if (t.userData.isPaving && !paving) {
+            paving = { obj: t, dist: hits[i].distance, point: hits[i].point };
+        }
+    }
+    for (let i = 0; i < placedObjects.length; i++) {
+        const o = placedObjects[i];
+        if (!o.userData.isModel || seen.has(o)) continue;
+        const r = screenRectOf(o, cam, camInv);
+        if (!r) continue;
+        const d = rectDist(r, cx, cy);
+        if (d > PICK_R) continue;
+        const wp = new THREE.Vector3(); o.getWorldPosition(wp);
+        models.push({ obj: o, px: d, cd: wp.distanceTo(camPos) });
+    }
+    models.sort((a, b) => (a.px - b.px) || (a.cd - b.cd));   // 先"点得最准"，再"离相机最近"
+    return { models: models, paving: paving };
+}
+
+function findInteractTarget(intersects) {   /* 旧接口保留，避免别处引用报错 */
     if (intersects.length === 0) return null;
-    // 按距离由近到远：先被射线打到谁就是谁
-    // → 点在模型上一定是"选中模型"；点在空铺装上才是"放置新模型"
     for (let i of intersects) {
         let t = i.object;
         while (t.parent && !t.userData.isPaving && !t.userData.isModel) t = t.parent;
@@ -4308,6 +4820,7 @@ function placeScatterOne(group, rec, baseY) {
         m.rotation.set(rec.rx, rec.ry, rec.rz);
         m.scale.multiplyScalar(rec.sc);
         m.position.set(rec.x - group.position.x, baseY - group.position.y + yOff, rec.z - group.position.z);
+        addPickBox(m, isTreeId(rec.id));   /* ★ 上百株草木不再逐叶做射线，点选瞬间响应 */
         group.add(m);
         registerSway(m, isTreeId(rec.id));
     }
@@ -4674,41 +5187,60 @@ function setupInteractions() {
         if (tpoolMode > 0 && currentMode === 'path') { if (touchesLength <= 1) tpoolDown(getGroundPointAtScreen(clientX, clientY)); return; }
         mouse.x = (clientX / window.innerWidth) * 2 - 1; mouse.y = -(clientY / window.innerHeight) * 2 + 1;
         if(touchesLength <= 1) {
-            raycaster.setFromCamera(mouse, getRayCamera());
-            const intersects = raycaster.intersectObjects(placedObjects, true);
-            let result = findInteractTarget(intersects);
-            /* ★ 2026.8.24 精准点选：删除原来"离已选模型 0.45m 内自动命中"的模糊判定。
-               现在必须射线真正打中模型本体，才会选中它；点空白/地面就是放置或取消选中。 */
-            if (scatterArmed && result && result.target.userData.isPaving) {
-                const info = getSurfaceInfo(result.target);
+            /* ★ 2026.10 点选内核：射线 → 像素补刀 → 同点循环切换 */
+            const pk = pickCandidates(clientX, clientY);
+            if (scatterArmed) {
+                const pv = pk.paving;
+                const info = pv ? getSurfaceInfo(pv.obj) : null;
                 if (info) {
-                    buildScatter(info.poly, info.y + 0.004, result.target.userData.isPondWithEdge ? '水面' : '此面', info.margin);
+                    buildScatter(info.poly, info.y + 0.004, pv.obj.userData.isPondWithEdge ? '水面' : '此面', info.margin);
                     scatterArmed = false;
                     const st = document.getElementById('scatter-toggle'); if (st) st.classList.remove('armed');
                     const bp = document.getElementById('btn-scatter-pick'); if (bp) bp.innerText = '👉 点选已有面/水池';
-                } else showSysToast('该对象不是可撒播的面');
+                } else showSysToast('请点在草地 / 铺装 / 池塘上');
                 return;
             }
-            /* ★ 2026.9.24：点空白 → 只取消选中（本次不放模型）；再点一次才放 */
             const _clearSel = () => {
-                if (selectedObj && pickedByTap) justDeselected = true;
+                if (selectedObj && pickedByTap) {
+                    const _c = getRayCamera();
+                    const _r = screenRectOf(selectedObj, _c, camInvOf(_c));
+                    /* 点在选中物附近 → 只取消选中；点得很远（>150px）→ 直接放模型，不用点两下 */
+                    justDeselected = !!(_r && rectDist(_r, clientX, clientY) <= 150);
+                }
                 pickedByTap = false;
                 selectObject(null);
                 document.getElementById('delete-toast').style.display = 'none';
             };
-            if (result) {
-                const target = result.target;
-                const isPaving = target.userData.isPaving;
-                const isModel = target.userData.isModel;
-                if (isModel || (isPaving && currentMode === 'path')) {
-                    hitExistingObject = true;   // 命中已有对象：只选中/拖动
-                    selectObject(target);
-                    pickedByTap = true;         // ★ 这是"用户手动点选"
-                    isLongPressActive = false;
-                    longPressTimer = setTimeout(() => { isLongPressActive = true; document.getElementById('delete-toast').style.display = 'flex'; document.getElementById('delete-backdrop').style.display = 'block'; }, 800);
-                    isDraggingModel = true;
-                    dragPlane.setFromNormalAndCoplanarPoint(new THREE.Vector3(0, 1, 0), target.position);
-                } else _clearSel();
+            let target = null;
+            if (pk.models.length) {
+                let idx = 0;
+                const rep = (Date.now() - PICK_CYC.t < 1600) &&
+                            Math.hypot(clientX - PICK_CYC.x, clientY - PICK_CYC.y) < 40;
+                if (rep && pk.models.length > 1 && selectedObj) {
+                    const cur = pk.models.findIndex(c => c.obj === selectedObj);
+                    if (cur >= 0) idx = (cur + 1) % pk.models.length;   /* 原地再点 → 换下一个重叠模型 */
+                }
+                target = pk.models[idx].obj;
+                PICK_CYC.x = clientX; PICK_CYC.y = clientY; PICK_CYC.t = Date.now();
+                if (pk.models.length > 1)
+                    showSysToast('👆 ' + pickName(target) + '（' + (idx + 1) + '/' + pk.models.length + '，原地再点一下换下一个）');
+            } else if (pk.paving && currentMode === 'path') target = pk.paving.obj;
+            if (target) {
+                hitExistingObject = true;
+                selectObject(target);
+                pickedByTap = true;
+                isLongPressActive = false;
+                const _tn = pickName(target);
+                longPressTimer = setTimeout(() => {          /* ★ 长按 460ms 就弹删除，并显示删的是谁 */
+                    isLongPressActive = true;
+                    const dt = document.getElementById('delete-toast');
+                    const tip = dt.firstElementChild;
+                    if (tip) tip.innerText = '删除「' + _tn + '」？';
+                    dt.style.display = 'flex';
+                    document.getElementById('delete-backdrop').style.display = 'block';
+                }, 460);
+                isDraggingModel = true;
+                dragPlane.setFromNormalAndCoplanarPoint(new THREE.Vector3(0, 1, 0), target.position);
             } else _clearSel();
         }
     };
@@ -4796,13 +5328,12 @@ function setupInteractions() {
                 }
             }
             else if (currentMode === 'path') {
-                raycaster.setFromCamera(mouse, getRayCamera());
-                const intersects = raycaster.intersectObjects(placedObjects, true);
-                let paving = intersects.find(i => { let t = i.object; while(t.parent && !t.userData.isPaving) t = t.parent; return t.userData.isPaving; });
-                if (paving) {
-                    let targetPaving = paving.object;
-                    while(targetPaving.parent && !targetPaving.userData.isPaving) targetPaving = targetPaving.parent;
-                    if (!targetPaving.userData.isPondWithEdge && !targetPaving.userData.isCurbWithFill) updatePavingMaterial(targetPaving, currentAsset);
+                /* ★ 2026.10：点在模型上就只选中它，绝不再顺手把下面的铺装材质改掉 */
+                if (hitExistingObject) {
+                    const _tp = selectedObj;
+                    if (_tp && _tp.userData.isPaving && !_tp.userData.isPondWithEdge && !_tp.userData.isCurbWithFill
+                        && !_tp.userData.isFence && !_tp.userData.isPathObj && !_tp.userData.isScatter)
+                        updatePavingMaterial(_tp, currentAsset);
                 } else if(pt) {
                     let np = (pathPoints.length > 0 && rubberTip) ? rubberTip.clone() : pt.clone();
                     np.userSharp = (cornerMode === 'sharp');
@@ -5248,6 +5779,7 @@ function generatePathModels() {
             model.scale.set(model.scale.x * sx, model.scale.y * baseScale, model.scale.z * sz);
             model.rotation.y = Math.random() * Math.PI * 2; 
             if (isSwayPlantId(currentAsset.modelId)) registerSway(model, isTreeId(currentAsset.modelId));
+            addPickBox(model, isTreeId(currentAsset.modelId));   /* ★ 路径上的草木改成盒子射线：又快又准 */
             group.add(model);
         }
     }
@@ -5762,6 +6294,7 @@ function buildTreePoolAt(center, radius, sides) {
         applyShadows(curb); group.add(curb);
     }
     group.position.set(center.x, center.y, center.z);
+    addPickBox(group, false);            /* ★ 树池也能一点就中 */
     scene.add(group); placedObjects.push(group);
     return group;
 }
@@ -6098,6 +6631,20 @@ function renderCloudModelList() {
         card.innerHTML = `<div class="asset-box" style="width:46px;height:46px;font-size:22px;">${asset.icon}</div><div class="asset-name" title="${asset.name}" style="font-size:10px;">${asset.name}</div>`;
         card.onclick = () => {
             currentAsset = asset;
+            if (asset.isVideo) {                       /* ★ 视频人物：只能单个摆放 */
+                asset.isPathObj = false;
+                const sp = document.getElementById('spacing-ctrl');
+                if (sp) sp.style.display = 'none';
+                if (currentMode !== 'object') {
+                    currentMode = 'object';
+                    updateUI(document.getElementById('tab-obj'));
+                    renderAssetList();
+                    selectObject(null);
+                }
+                renderCloudModelList();
+                showSysToast('已选「' + asset.name + '」：点地面放置；轻点她即可语音聊天');
+                return;
+            }
             // 关键：云库模型永久具备"沿路径按间距排布"能力（object 模式下不受影响）
             asset.isPathObj = true;
             asset.modelId = asset.id;
@@ -6180,6 +6727,15 @@ function placeSavedSingle(rec) {
         obj.scale.set(rec.scale[0], rec.scale[1], rec.scale[2]);
         obj.position.set(rec.pos[0], rec.pos[1] + groundLevel, rec.pos[2]);
     };
+    if (id.indexOf('vchar_') === 0) {                 /* ★ 视频人物：读档恢复 */
+        vcharGet(id, (box) => {
+            const g = vcharBuild(id, box);
+            finalize(g);
+            scene.add(g); placedObjects.push(g);
+            vcharFaceUser(g);
+        });
+        return;
+    }
     if (id.startsWith('cloud_')) {
         getCloudModel(id, (model) => {
             model.userData.isModel = true; model.userData.id = id;model.userData.baseScale = rec.baseScale || [model.scale.x, model.scale.y, model.scale.z];
@@ -6199,6 +6755,8 @@ function placeSavedSingle(rec) {
         const group = getModelGeometry(id); applyShadows(group);
         group.userData.isModel = true; group.userData.id = id;group.userData.baseScale = rec.baseScale || [1,1,1];
         finalize(group);
+        if (isSwayPlantId(id)) registerSway(group, isTreeId(id));
+        addPickBox(group, isTreeId(id));  /* ★ 读档后一样点得准 */
         scene.add(group); placedObjects.push(group);
     }
 }
@@ -6283,6 +6841,7 @@ const INV_LOCAL_NAMES = {
     grass:'草地', water:'水面', clear_pond:'清澈池塘', stone:'石材铺装', dirt:'泥土'
 };
 const INV_UNIT_MAP = {
+    vchar_GuiFuRen:'位',
     pavilion:'座', lamp:'盏', railing:'组',
     cloud_ZhongShiLiangTing:'座', cloud_LiuJiaoTing:'座', cloud_ShiGongQiao:'座',
     cloud_ShiZhuoGuDengZu:'套',
@@ -6602,6 +7161,7 @@ const SF_VOICES = [
 ];
 /* ★ 角色 → 专属声线（⚙ 里可关掉"按角色自动配音"改为手动） */
 const CHAR_VOICE = {
+    '贵夫人·视频': 'guixiu',
     '观音': 'guanyin',
     '唐代美人': 'guixiu',
     '古装美人': 'guixiu',
@@ -6995,6 +7555,13 @@ function characterName(obj) {
     const m = CLOUD_MODELS.find(x => x.id === id);
     return (m && m.name) || '神秘人';
 }
+/* ★ 多人同场：给每位人物一个稳定编号，通话条上一眼看清正在跟谁说话（同名也不混） */
+let _npcSeq = 0;
+function chatLabel(obj) {
+    if (!obj.userData._npcNo) obj.userData._npcNo = ++_npcSeq;
+    const n = characterName(obj);
+    return (_npcSeq > 1) ? (n + '·' + obj.userData._npcNo) : n;
+}
 
 /* ================= 二、说话动作驱动（顶点着色器，无需骨骼） ================= */
 const TALK_GLSL = `
@@ -7176,6 +7743,12 @@ function _buildTalkRigOld(obj) {
 const TALK = { rig: null, on: false, amp: 0, jaw: 0, jawT: 0, jawNext: 0, blink: 0, blinkNext: 0, seed: Math.random() * 99 };
 function talkStart() { if (TALK.rig) TALK.on = true; }
 function talkStop() { TALK.on = false; }
+/* ★ 多人同场：切人物 / 挂断时，把上一位的说话动作归零，姿态立刻复原 */
+function talkResetRig(rig) {
+    if (!rig || !rig.u) return;
+    const u = rig.u;
+    ['uJaw', 'uBlink', 'uNod', 'uTurn', 'uArm', 'uBody', 'uBob'].forEach(k => { if (u[k]) u[k].value = 0; });
+}
 
 let chatTarget = null;
 function updateTalkAnim(t) {
@@ -7227,18 +7800,18 @@ if (VC.set.asr     === undefined) VC.set.asr = 'cloud';
 if (VC.set.sfVoice === undefined) VC.set.sfVoice = 'guixiu';
 if (VC.set.autoVoice === undefined) VC.set.autoVoice = true;   /* ★ 按角色自动配音 */
 if (VC.set.emo     === undefined) VC.set.emo = true;
-if (VC.set.sens    === undefined) VC.set.sens = 0.032;   /* ★ 麦克风灵敏度门限：越大越不容易误触发 */
+if (VC.set.sens    === undefined) VC.set.sens = 0.0090;  /* ★ 越大越不容易误触发；0.009=很灵敏 */
 if (VC.set.ptt     === undefined) VC.set.ptt = false;    /* ★ 按住说话（最防误触发） */
 if (VC.set.share   === undefined) VC.set.share = true;   /* ★ 接通即共享画面，她默认"看得见" */
-if (VC.set._v !== 6) {                       // 只纠正一次
-    VC.set._v = 6;
+if (VC.set._v !== 8) {                       // 只纠正一次
+    VC.set._v = 8;
     VC.set.tts = 'cloud';                    // 默认云端情感语音
     VC.set.asr = 'cloud';                    // 默认云端识别（无"叮"提示音）
     VC.set.share = true;                     // 默认开启看画面
     VC.set.autoVoice = true;                 // 按角色自动配音
     VC.set.sfVoice = 'guixiu';               // 默认书香女子声线
     VC.set.rate = 0.94; VC.set.pitch = 0.90; // ★2026.9.24 更成熟温润、柔和舒缓
-    VC.set.sens = 0.042;                     // 更不容易被杂声误触发
+    VC.set.sens = 0.0090;                    // ★2026.10.06 再调灵敏：正常说话必进
 }
 if (String(VC.set.model || '').indexOf('agnes') === 0 ||
     AGNES_MODELS.findIndex(m => m.id === VC.set.model) < 0) VC.set.model = AGNES_MODELS[0].id;
@@ -7403,7 +7976,7 @@ function ttsStop() {
 function ttsBegin() { ttsStop(); SPEAK_ALL = ''; ttsDone = false; }
 function _ttsIdle() {
     ttsSpeaking = false; SPEAK_NOW = ''; SFV.level = 0; SPEAK_END_TS = Date.now(); talkStop();
-    try { if (REC.on) recCut(false); } catch (e) {}   /* ★ 开一段全新录音：她自己的声音永远进不了识别 */
+    try { recRefresh(); } catch (e) {}   /* ★ 你插话的那一段要送识别，纯她自己的声音才丢掉 */
     try { VAD.voiceMs = 0; VAD.speaking = false; } catch (e) {}
     vcStatus(recOn ? (VC.set.ptt ? '🎙 按住说话' : '● 聆听中') : '‖ 已暂停');
 }
@@ -7475,7 +8048,7 @@ function ttsPush(text, isLast) {
         if (!ttsSpeaking) {
             ttsSpeaking = true; talkStart(); vcStatus('◉ 说话中');
             recGuardTo = Date.now() + 380;
-            try { if (REC.on) recCut(false); } catch (e) {}   /* ★ 她开口 → 丢弃当前段，重开干净录音 */
+            try { recRefresh(); } catch (e) {}   /* ★ 她开口 → 你已说完的话先送识别，再重开干净录音 */
         }
         if (!ttsRunning) {
             if (cloud) { ttsRunning = true; _ttsPumpCloud(ttsToken); }
@@ -7490,25 +8063,30 @@ const SR_CLS = window.SpeechRecognition || window.webkitSpeechRecognition;
 let recObj = null, recOn = false, recActive = false, recBuf = '', recTimer = null, recGuardTo = 0, recLastStart = 0;
 
 function useCloudASR() {
-    return !RT_ASR_LOCAL && VC.set.asr !== 'local' && !!window.MediaRecorder &&
+    const AC = window.AudioContext || window.webkitAudioContext;
+    return !RT_ASR_LOCAL && VC.set.asr !== 'local' && !!AC &&
            !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia) &&
            String(SF_API_KEY).indexOf('sk-') === 0;
 }
 
 /* ---------- 麦克风闸门参数（可在设置面板里滑动条现场调灵敏度） ---------- */
 const MIC = {
-    absOn:     0.042,   // 绝对能量门限（设置里的"麦克风灵敏度"会覆盖它）
-    onMul:     3.8,     // 起始门限 = 底噪 × 3.8
-    offMul:    1.9,     // 结束门限 = 底噪 × 1.9
-    bargeMul:  7.5,     // 她说话时要打断，门限倍数
-    startMs:   420,     // 必须连续 420ms 有人声，才算"你真的在跟我说话"
-    endMs:     700,     // 静音 700ms 才算"你说完了"（句子更完整）
-    minVoiceMs:600,     // 一段录音累计人声不足 600ms → 当杂声丢掉
-    peakMul:   1.50,    // 段内峰值必须够响，远处电视/键盘/走路声全过不了
-    tailMs:    1300,    // 她说完后的回声静默期
-    bargeMs:   520      // 打断需要持续 520ms 的清晰人声
+    absOn:     0.0090,  // ★2026.10.06 绝对门限再降：正常说话必进
+    onMul:     1.70,    // 起始门限 = 底噪 × 1.7
+    offMul:    1.15,    // 结束门限 = 底噪 × 1.15
+    bargeMul:  3.20,    // 她说话时打断的门限倍数
+    startMs:   100,     // 0.10 秒有人声就开始收
+    endMs:     460,     // 停 0.46 秒算你说完，立刻送识别
+    minVoiceMs:110,     // 一段里有 0.11 秒人声就算有效
+    softMul:   0.55,    // 轻声门限 = 起始门限 × 0.55
+    softMs:    420,     // 轻声累计够 0.42 秒也照样送识别
+    peakMul:   0,       // ★峰值闸门彻底取消（以前会把正常说话也吞掉）
+    tailMs:    520,     // 她说完后的回声静默期
+    bargeMs:   220,     // 0.22 秒就能把她的话打断
+    maxSegMs:  11000,   // 一直说不停 → 每 11 秒自动切一段送识别
+    idleMs:    9000     // 一直没人声 → 每 9 秒换一段新缓冲
 };
-function micSens() { return Math.max(0.010, Math.min(0.120, VC.set.sens || MIC.absOn)); }
+function micSens() { return Math.max(0.0035, Math.min(0.120, VC.set.sens || MIC.absOn)); }
 const PTT = { hold: false };
 function pttDown() {
     PTT.hold = true;
@@ -7529,9 +8107,133 @@ function pttUp() {
 
 /* ---------- 麦克风实时音量 VAD：判断"你开口了 / 你说完了" ---------- */
 const VAD = { on:false, ac:null, an:null, src:null, stream:null, data:null,
-              speaking:false, lastVoice:0, speechStart:0, floor:0.0090, raf:0,
+              speaking:false, lastVoice:0, speechStart:0, floor:0.0090, raf:0, timer:0,
               hot:0, level:0, ever:false, t0:0, warnTs:0, uiN:0,
-              voiceMs:0, lastT:0 };
+              voiceMs:0, lastT:0, rms:0, peak:0, restarting:false };
+/* ★★★ 2026.10.06 彻底重写麦克风采集：不再用 MediaRecorder ★★★
+   ① 以前上传 webm/opus，硅基流动识别接口常直接报错 → 代码就静默降级到本地识别，
+      而套壳 App 里没有本地识别 → 于是你说半天她一点反应都没有。
+      现在自己编 16k 单声道 WAV 上传，接口必收，永不再降级。
+   ② PCM 环形缓冲 + 0.3 秒预卷：切段瞬间不丢字，第一个字一定录得到。
+   ③ 人声判断直接由采集回调驱动，不依赖 analyser 与 rAF，AR 里也不会失灵。
+   ④ 上传前自动增益：小声说话也拉到饱满音量，识别率大幅提升。 */
+const PCM = { sr:0, buf:null, cap:0, w:0, total:0, node:null, sink:null, lastCb:0 };
+function pcmAlloc(sr) {
+    PCM.sr = sr || 48000;
+    PCM.cap = Math.round(PCM.sr * 20);          // 20 秒环形缓冲
+    PCM.buf = new Float32Array(PCM.cap);
+    PCM.w = 0; PCM.total = 0;
+}
+function pcmWrite(inp) {
+    if (!PCM.buf) return;
+    const n = inp.length, cap = PCM.cap;
+    let w = PCM.w;
+    for (let i = 0; i < n; i++) { PCM.buf[w] = inp[i]; if (++w >= cap) w = 0; }
+    PCM.w = w; PCM.total += n;
+}
+function pcmSlice(a, b) {
+    if (!PCM.buf) return new Float32Array(0);
+    const oldest = Math.max(0, PCM.total - PCM.cap);
+    if (a < oldest) a = oldest;
+    if (b > PCM.total) b = PCM.total;
+    const n = b - a;
+    if (n <= 0) return new Float32Array(0);
+    const out = new Float32Array(n);
+    let idx = (PCM.w - (PCM.total - a)) % PCM.cap;
+    if (idx < 0) idx += PCM.cap;
+    for (let i = 0; i < n; i++) { out[i] = PCM.buf[idx]; if (++idx >= PCM.cap) idx = 0; }
+    return out;
+}
+function pcmTo16k(src, sr) {
+    if (!src.length || Math.abs(sr - 16000) < 1) return src;
+    const ratio = sr / 16000;
+    const n = Math.max(1, Math.floor(src.length / ratio));
+    const win = Math.max(1, Math.floor(ratio));
+    const out = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+        const p = Math.floor(i * ratio);
+        let s = 0, c = 0;
+        for (let k = 0; k < win && p + k < src.length; k++) { s += src[p + k]; c++; }
+        out[i] = c ? s / c : 0;
+    }
+    return out;
+}
+function wavBlob(f32) {
+    let pk = 0;
+    for (let i = 0; i < f32.length; i++) { const v = f32[i] < 0 ? -f32[i] : f32[i]; if (v > pk) pk = v; }
+    const g = (pk > 0.0015 && pk < 0.86) ? (0.86 / pk) : 1;      // 自动增益
+    const n = f32.length, buf = new ArrayBuffer(44 + n * 2), dv = new DataView(buf);
+    const put = (o, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); };
+    put(0, 'RIFF'); dv.setUint32(4, 36 + n * 2, true); put(8, 'WAVE');
+    put(12, 'fmt '); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+    dv.setUint32(24, 16000, true); dv.setUint32(28, 32000, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+    put(36, 'data'); dv.setUint32(40, n * 2, true);
+    let o = 44;
+    for (let i = 0; i < n; i++) {
+        let s = f32[i] * g; if (s > 1) s = 1; else if (s < -1) s = -1;
+        dv.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7fff, true); o += 2;
+    }
+    return new Blob([buf], { type: 'audio/wav' });
+}
+/* 人声状态机：由采集回调驱动（约 43 毫秒一次），AR 里照样跑 */
+function vadTick(rms, pk, dt) {
+    VAD.rms = VAD.rms * 0.55 + rms * 0.45;
+    VAD.level = VAD.rms;
+    if (pk > VAD.peak) VAD.peak = pk;
+    const T = Date.now();
+    const talking = ttsSpeaking || (T < SPEAK_END_TS + MIC.tailMs);
+    if (!VAD.speaking && !talking && rms < VAD.floor * 2.2) VAD.floor = VAD.floor * 0.985 + rms * 0.015;
+    VAD.floor = Math.max(0.0012, Math.min(0.0600, VAD.floor));
+    const sens = micSens();
+    const thOn   = talking ? Math.max(sens * 2.4, VAD.floor * MIC.bargeMul) : Math.max(sens, VAD.floor * MIC.onMul);
+    const thOff  = talking ? thOn * 0.60 : Math.max(sens * 0.50, VAD.floor * MIC.offMul);
+    const thSoft = thOn * MIC.softMul;
+    if ((VAD.uiN = (VAD.uiN + 1) % 3) === 0) vcMeter(rms, thOn);
+    if (rms > thOn) { VAD.voiceMs = Math.min(6000, VAD.voiceMs + dt); VAD.lastVoice = T; }
+    else if (rms < thOff) VAD.voiceMs = Math.max(0, VAD.voiceMs - dt * 1.2);
+    if (REC.on) {
+        if (ttsSpeaking) REC.overlap = true;
+        if (rms > thOn) { REC.voiceMs += dt; if (rms > REC.peak) REC.peak = rms; }
+        else if (rms > thSoft) REC.softMs += dt;
+    }
+    const gate = (!VC.set.ptt) || PTT.hold;
+    if (!VAD.speaking) {
+        if (gate && VAD.voiceMs >= (talking ? MIC.bargeMs : MIC.startMs)) {
+            VAD.speaking = true; VAD.ever = true;
+            if (talking) REC.bargeOK = true;
+            onUserVoiceStart();
+        }
+    } else {
+        if (!gate) VAD.speaking = false;
+        else if (rms < thOff && T - VAD.lastVoice > MIC.endMs) { VAD.speaking = false; onUserVoiceEnd(); }
+    }
+}
+/* 200 毫秒巡检：超长切段 / 空段回收 / 麦克风假死自愈 */
+function vadWatch() {
+    if (!VAD.on) return;
+    const T = Date.now();
+    try { if (VAD.ac && VAD.ac.state === 'suspended') VAD.ac.resume(); } catch (e) {}
+    if (recOn && VC.on && PCM.lastCb && T - PCM.lastCb > 2000 && !VAD.restarting) {
+        VAD.restarting = true;
+        vcStatus('⚠ 麦克风假死，正在自动重启…');
+        try { vadStop(); } catch (e) {}
+        setTimeout(async () => {
+            VAD.restarting = false;
+            if (!recOn || !VC.on) return;
+            const ok = await vadStart();
+            if (ok) { REC.on = false; recOpen(); vcStatus('● 已恢复聆听'); }
+            else vcStatus('⚠ 麦克风恢复失败，请重新接通');
+        }, 300);
+        return;
+    }
+    if (!VC.set.ptt && REC.on) {
+        if (T - REC.t0 > MIC.maxSegMs) recCut(REC.voiceMs >= 260 || REC.softMs >= 900);
+        else if (!VAD.speaking && T - REC.t0 > MIC.idleMs) recCut(REC.voiceMs >= 260);
+    }
+    if (!VAD.ever && !ttsSpeaking && T - VAD.t0 > 12000 && T - VAD.warnTs > 12000) {
+        VAD.warnTs = T; vcStatus('⚠ 没听到人声，请靠近手机说话');
+    }
+}
 
 async function vadStart() {
     if (VAD.on) return true;
@@ -7544,28 +8246,51 @@ async function vadStart() {
         VAD.ac = new AC();
         if (VAD.ac.state === 'suspended') { try { await VAD.ac.resume(); } catch (e) {} }
         VAD.src = VAD.ac.createMediaStreamSource(VAD.stream);
-        VAD.an  = VAD.ac.createAnalyser();
-        VAD.an.fftSize = 1024; VAD.an.smoothingTimeConstant = 0.35;
-        VAD.src.connect(VAD.an);
-        VAD.data = new Uint8Array(VAD.an.fftSize);
-        VAD.on = true; VAD.floor = 0.0090; VAD.hot = 0; VAD.level = 0;
-        VAD.ever = false; VAD.t0 = Date.now(); VAD.warnTs = 0;
-        vadLoop();
+        pcmAlloc(VAD.ac.sampleRate || 48000);
+        const mkSP = VAD.ac.createScriptProcessor || VAD.ac.createJavaScriptNode;
+        if (!mkSP) throw new Error('no ScriptProcessor');
+        PCM.node = mkSP.call(VAD.ac, 2048, 1, 1);
+        PCM.node.onaudioprocess = (ev) => {
+            let inp;
+            try { inp = ev.inputBuffer.getChannelData(0); } catch (e) { return; }
+            PCM.lastCb = Date.now();
+            let s = 0, pk = 0;
+            for (let i = 0; i < inp.length; i++) {
+                const x = inp[i]; s += x * x;
+                const av = x < 0 ? -x : x; if (av > pk) pk = av;
+            }
+            pcmWrite(inp);
+            try { vadTick(Math.sqrt(s / Math.max(1, inp.length)), pk, (inp.length / PCM.sr) * 1000); } catch (e) {}
+        };
+        PCM.sink = VAD.ac.createGain(); PCM.sink.gain.value = 0;
+        VAD.src.connect(PCM.node); PCM.node.connect(PCM.sink); PCM.sink.connect(VAD.ac.destination);
+        VAD.an = null; VAD.data = null;
+        VAD.on = true; VAD.floor = 0.0090; VAD.hot = 0; VAD.level = 0; VAD.rms = 0; VAD.peak = 0;
+        VAD.voiceMs = 0; VAD.speaking = false; PCM.lastCb = Date.now();
+        VAD.ever = false; VAD.t0 = Date.now(); VAD.warnTs = 0; VAD.lastT = Date.now();
+        /* ★★ 2026.10 关键修复：进入 AR(immersive) 后浏览器会暂停页面 requestAnimationFrame，
+           原来用 rAF 驱动的人声检测就整段不跑 → 每段录音都被当杂声丢掉，
+           这才是"说半天她才偶尔听到一次"的真正原因。改用定时器，AR 内外都稳定。 */
+        try { clearInterval(VAD.timer); } catch (e) {}
+        VAD.timer = setInterval(vadWatch, 200);
         return true;
     } catch (e) { VAD.on = false; return false; }
 }
 function vadStop() {
-    VAD.on = false; VAD.speaking = false; VAD.hot = 0; VAD.level = 0;
+    VAD.on = false; VAD.speaking = false; VAD.hot = 0; VAD.level = 0; VAD.rms = 0;
     try { cancelAnimationFrame(VAD.raf); } catch (e) {}
+    try { clearInterval(VAD.timer); } catch (e) {}
+    VAD.timer = 0;
+    try { if (PCM.node) { PCM.node.onaudioprocess = null; PCM.node.disconnect(); } } catch (e) {}
+    try { if (PCM.sink) PCM.sink.disconnect(); } catch (e) {}
     try { if (VAD.src) VAD.src.disconnect(); } catch (e) {}
     try { if (VAD.stream) VAD.stream.getTracks().forEach(t => t.stop()); } catch (e) {}
     try { if (VAD.ac) VAD.ac.close(); } catch (e) {}
+    PCM.node = null; PCM.sink = null; PCM.buf = null; PCM.total = 0; PCM.w = 0;
     VAD.ac = VAD.an = VAD.src = VAD.stream = null;
 }
 function vadLoop() {
-    if (!VAD.on) return;
-    VAD.raf = requestAnimationFrame(vadLoop);
-    if (!VAD.an) return;
+    if (!VAD.on || !VAD.an) return;      /* ★ 由 setInterval(40ms) 驱动，不再依赖 rAF */
     VAD.an.getByteTimeDomainData(VAD.data);
     let s = 0, n = 0, pk = 0;
     for (let i = 0; i < VAD.data.length; i += 2) {
@@ -7623,53 +8348,42 @@ function vadLoop() {
 }
 
 /* ---------- 连续录音 + 静音切段 → 云端识别（开头一个字都不会丢） ---------- */
-const REC = { mr:null, chunks:[], on:false, t0:0, busy:false, mime:'',
-              hadVoice:false, cutTimer:null, sendIt:false,
-              voiceMs:0, peak:0, overlap:false, bargeOK:false };
-function pickRecMime() {
-    const list = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus', 'audio/ogg'];
-    for (let i = 0; i < list.length; i++) {
-        try { if (window.MediaRecorder && MediaRecorder.isTypeSupported(list[i])) return list[i]; } catch (e) {}
-    }
-    return '';
-}
-function recOpen() {
-    if (!VAD.stream || REC.on || !recOn) return;
-    try {
-        if (!REC.mime) REC.mime = pickRecMime();
-        REC.mr = REC.mime ? new MediaRecorder(VAD.stream, { mimeType: REC.mime, audioBitsPerSecond: 32000 })
-                          : new MediaRecorder(VAD.stream);
-        REC.chunks = []; REC.hadVoice = false; REC.sendIt = false;
-        REC.voiceMs = 0; REC.peak = 0; REC.overlap = false; REC.bargeOK = false;
-        REC.mr.ondataavailable = (e) => { if (e.data && e.data.size) REC.chunks.push(e.data); };
-        REC.mr.onstop = () => {
-            REC.on = false;
-            const send = REC.sendIt; REC.sendIt = false;
-            if (send) sfASRSend(); else REC.chunks = [];
-            if (recOn && VAD.on) setTimeout(recOpen, 40);
-        };
-        REC.mr.start(250);
-        REC.on = true; REC.t0 = Date.now();
-    } catch (e) { REC.on = false; asrFallbackLocal('录音不可用'); }
+const REC = { on:false, t0:0, busy:false, sendIt:false, cutTimer:null, hadVoice:false,
+              start:0, voiceMs:0, softMs:0, peak:0, overlap:false, bargeOK:false,
+              err:0, sent:0, lastTxt:'', lastErr:'' };
+function recVoiceEnough() { return (REC.voiceMs >= MIC.minVoiceMs) || (REC.softMs >= MIC.softMs); }
+function recOpen(pre) {
+    if (!VAD.on || !PCM.buf || REC.on || !recOn) return;
+    const p = (pre === undefined) ? 0.30 : pre;        // 预卷 0.3 秒：第一个字绝不丢
+    REC.start = Math.max(0, PCM.total - Math.round(PCM.sr * p));
+    REC.t0 = Date.now();
+    REC.voiceMs = 0; REC.softMs = 0; REC.peak = 0;
+    REC.overlap = !!ttsSpeaking; REC.bargeOK = false; REC.hadVoice = false;
+    REC.on = true;
 }
 function recCut(send) {
     clearTimeout(REC.cutTimer);
-    if (!REC.on || !REC.mr) return;
-    REC.sendIt = !!send;
-    try { REC.mr.stop(); } catch (e) { REC.on = false; }
+    if (!REC.on) return;
+    REC.on = false;
+    const a = REC.start, b = PCM.total;
+    const vms = REC.voiceMs, sms = REC.softMs, ovl = REC.overlap, brg = REC.bargeOK;
+    if (recOn && VAD.on) recOpen(send ? 0.02 : 0.30);   // 立刻开新段，中间不留空档
+    if (send) sfASRSend(a, b, vms, sms, ovl, brg);
+}
+function recRefresh() {   /* 她开口 / 说完时：你的话够长就送识别，否则才丢掉 */
+    if (REC.on) recCut(recVoiceEnough());
 }
 /* ★ 语音识别文本闸门：幻听 / 语气词 / 重复 / 太短 全部拦掉，绝不让她自问自答 */
 const ASR_LAST = { t: '', at: 0 };
-const ASR_NOISE = /^[\s，。、,.!?！？~\-—…()（）【】\[\]"']*(?:(?:嗯|啊|哦|噢|喔|唔|呃|额|欸|哎|唉|呀|哈|嘿|哼|喂|咦|哟|嘛|吧|呢|喽|噜|那个|这个|然后|就是|好的|好吧|ok|okay|uh|um|ah|oh|hm+|mm+|en|yeah|yep|hi|hello|bye|the|a|i|you)[\s，。、,.!?！？~\-—…]*)+$/i;
+const ASR_NOISE = /^[\s，。、,.!?！？~\-—…()（）【】\[\]"']*(?:(?:嗯|啊|哦|噢|喔|唔|呃|额|欸|哎|唉|呀|哈|嘿|哼|咦|哟|喽|噜|uh|um|ah|oh|hm+|mm+|the|a|i)[\s，。、,.!?！？~\-—…]*)+$/i;
 const ASR_HALLU = /(谢谢观看|感谢观看|谢谢大家|请?订阅|点赞|投币|转发|关注一下|字幕|明镜|与点点栏目|不吝|打赏|下期再见|拜拜|MBC|뉴스|ご視聴|ありがとう|Thanks\s*for\s*watching|Subscribe)/i;
 /* ★ 2026.9.23：只回应"我主动跟她说的话"——疑问 / 指令 / 完整句子才算，杂声与自言自语一律不理 */
 const RX_ASK = /(吗|呢|吧|么|嘛|什么|啥|怎么|怎样|如何|为什么|为啥|为何|哪|哪里|哪个|哪些|几|多少|多久|多大|多高|多宽|是不是|有没有|能不能|可不可以|行不行|好不好|要不要|该不该|可以|能否|帮我|帮忙|告诉|教教|教我|说说|讲讲|讲下|说下|看看|瞧瞧|查|搜|介绍|推荐|建议|意见|方案|设计|布置|摆|放|种|做|算|测|问你|请问|你说|你看|你觉得|你会|你能|你知道|风水|景观|铺装|水池|池塘|树池|栏杆|凉亭|假山|植物|绿化)/;
 function asrIsAsk(raw) {
+    /* ★2026.10：不再挑三拣四。以前"这个太大了""再高一点"这类话因为不含疑问词被直接丢掉，
+       就成了"说半天她没反应"。现在只要识别出 2 个字以上，就当成你在跟她说话。 */
     const s = String(raw || '').replace(/[\s，。、,.!?！？~\-—…()（）【】\[\]"'：:；;]/g, '');
-    if (s.length < 4) return false;                  // 太短一律当杂声
-    if (/[?？]/.test(String(raw))) return true;       // 明确问句
-    if (RX_ASK.test(s)) return true;                  // 含疑问词 / 指令词 / 专业词
-    return s.length >= 8;                             // 足够长的完整句子也算主动说话
+    return s.length >= 2;
 }
 function asrTextOK(raw) {
     const r = String(raw || '');
@@ -7681,33 +8395,29 @@ function asrTextOK(raw) {
     if (/^([\u4e00-\u9fa5a-zA-Z])\1+$/.test(s)) return false;                 /* 啊啊啊 / hhh */
     if (s.length <= 3 && /^[a-zA-Z]+$/.test(s)) return false;                 /* 英文碎片 */
     if (s.length >= 4 && new Set(s.split('')).size <= 2) return false;
-    if (s === ASR_LAST.t && Date.now() - ASR_LAST.at < 2500) return false;    /* 重复上报 */
+    if (s === ASR_LAST.t && Date.now() - ASR_LAST.at < 1200) return false;    /* 重复上报 */
     ASR_LAST.t = s; ASR_LAST.at = Date.now();
     return true;
 }
-async function sfASRSend() {
-    const type = REC.mime || 'audio/webm';
-    const blob = new Blob(REC.chunks, { type: type });
-    const segMs = Date.now() - (REC.t0 || Date.now());
-    const vms = REC.voiceMs, pkv = REC.peak, ovl = REC.overlap, brg = REC.bargeOK;
-    REC.chunks = []; REC.voiceMs = 0; REC.peak = 0;
-    if (blob.size < 1200 || segMs < 380) { vcStatus('● 聆听中'); return; }
-    if (!VC.set.ptt) {
-        /* 闸门①：累计人声太短 → 是噪音 */
-        if (vms < MIC.minVoiceMs) { vcStatus('● 聆听中'); return; }
-        /* 闸门②：峰值不够响 → 是远处杂音 */
-        if (pkv < micSens() * MIC.peakMul) { vcStatus('● 聆听中'); return; }
-        /* 闸门③：整段夹在她说话里，且没检测到真正的打断 → 是回声 */
-        if (ovl && !brg) { vcStatus('● 聆听中'); return; }
-    }
+async function sfASRSend(a, b, vms, sms, ovl, brg) {
+    const segMs = ((b - a) / Math.max(1, PCM.sr)) * 1000;
+    if (segMs < 220) { vcStatus('● 聆听中'); return; }
+    /* ★ 只留一道闸门：这一段里到底有没有人声。峰值闸门、她说话期间一律丢、
+         必须像提问才回答 —— 这三道以前会把你正常说的话统统吞掉，全部取消。 */
+    if (!VC.set.ptt && !(vms >= MIC.minVoiceMs || sms >= MIC.softMs)) { vcStatus('● 聆听中'); return; }
+    const raw = pcmSlice(a, b);
+    if (!raw.length) { vcStatus('● 聆听中'); return; }
+    let rpk = 0;
+    for (let i = 0; i < raw.length; i++) { const v = raw[i] < 0 ? -raw[i] : raw[i]; if (v > rpk) rpk = v; }
+    if (rpk < 0.0025) { vcStatus('● 聆听中'); return; }   // 纯静音，不浪费一次请求
+    const blob = wavBlob(pcmTo16k(raw, PCM.sr));
     REC.busy = true; vcStatus('○ 识别中…');
     const ctl = new AbortController();
     const to = setTimeout(() => { try { ctl.abort(); } catch (e) {} }, 16000);
     try {
-        const ext = type.indexOf('mp4') >= 0 ? 'mp4' : (type.indexOf('ogg') >= 0 ? 'ogg' : 'webm');
         const fd = new FormData();
         fd.append('model', SF_ASR_MODEL);
-        fd.append('file', blob, 'voice.' + ext);
+        fd.append('file', blob, 'voice.wav');
         const r = await fetch(SF_ASR_URL(), {
             method: 'POST', signal: ctl.signal,
             headers: { 'Authorization': 'Bearer ' + SF_API_KEY },
@@ -7718,25 +8428,63 @@ async function sfASRSend() {
         const j = await r.json();
         let t = (j && (j.text || (j.results && j.results[0] && j.results[0].text))) || '';
         t = String(t).replace(/<\|[^|]*\|>/g, '').replace(/\s+/g, '').trim();
-        REC.busy = false;
-        if (!asrTextOK(t)) { vcStatus('● 聆听中'); return; }
-        if (looksLikeEcho(t) && (ovl || ttsSpeaking || Date.now() - SPEAK_END_TS < 2500)) { vcStatus('● 聆听中'); return; }
+        REC.busy = false; REC.err = 0; REC.sent++; REC.lastTxt = t;
+        if (!asrTextOK(t)) { vcStatus('● 聆听中' + (t ? ('（已忽略:' + t.slice(0, 8) + '）') : '（没听到字）')); return; }
+        if (looksLikeEcho(t) && (ovl || ttsSpeaking || Date.now() - SPEAK_END_TS < 1200)) { vcStatus('● 聆听中'); return; }
         /* ★ 只回应主动提问；"按住说话"模式下你显然是在说，所以不再过滤 */
-        if (!VC.set.ptt && !asrIsAsk(t)) { vcStatus('● 聆听中（未识别为提问）'); return; }
+        REC.hadVoice = false;   /* ★2026.10.06 取消提问判断：你说什么她都要听 */
         vcStatus('👤 ' + t.slice(0, 12));
         sendChat(t);
     } catch (e) {
         clearTimeout(to); REC.busy = false;
-        asrFallbackLocal('识别失败(' + ((e && e.message) || '') + ')');
+        REC.lastErr = (e && e.message) || '网络失败';
+        asrFallbackLocal('识别失败(' + REC.lastErr.slice(0, 26) + ')');
     }
 }
 function asrFallbackLocal(msg) {
     if (VC.set.asr === 'local' || RT_ASR_LOCAL) { vcStatus('⚠ ' + msg); return; }
-    RT_ASR_LOCAL = true;
-    vcStatus('⚠ ' + msg + ' → 已切本地识别');
+    REC.err = (REC.err || 0) + 1;
+    vcStatus('⚠ ' + msg + (REC.err < 3 ? '，自动重试中…' : ''));
+    if (REC.err < 3) return;                     // 偶发抖动 → 继续用云端，绝不轻易降级
+    if (!SR_CLS) {                               // 套壳 App 没有本地识别，降级只会彻底哑掉
+        REC.err = 0;
+        showSysToast('⚠ 云端识别连不上，请检查网络/密钥（已继续重试，可先用文字输入）');
+        return;
+    }
+    RT_ASR_LOCAL = true; REC.err = 0;
+    vcStatus('⚠ 云端识别不可用 → 已切本地识别');
     try { recStop(); } catch (e) {}
     setTimeout(() => { if (VC.on) recStart(); }, 400);
 }
+/* ===== 自检：控制台敲 micTest() 看麦克风，敲 asrTest() 直接测识别 ===== */
+window.micTest = function () {
+    const s = '麦克风:' + (VAD.on ? '已开' : '未开')
+        + ' 采样率:' + (PCM.sr || 0)
+        + ' 回调:' + (PCM.lastCb ? ((Date.now() - PCM.lastCb) + 'ms前') : '无')
+        + ' 音量:' + (VAD.rms || 0).toFixed(4)
+        + ' 底噪:' + VAD.floor.toFixed(4)
+        + ' 门限:' + micSens().toFixed(4)
+        + ' 已送识别:' + REC.sent + '次'
+        + ' 最近文本:' + (REC.lastTxt || '无')
+        + ' 最近错误:' + (REC.lastErr || '无');
+    console.log(s); showSysToast(s.slice(0, 95)); return s;
+};
+window.asrTest = async function (sec) {
+    if (!VAD.on) { const ok = await vadStart(); if (!ok) { showSysToast('❌ 麦克风打不开'); return '麦克风打不开'; } }
+    showSysToast('🎙 请现在说话，' + (sec || 3) + ' 秒后自动上传识别…');
+    const a0 = PCM.total;
+    await new Promise(r => setTimeout(r, (sec || 3) * 1000));
+    const blob = wavBlob(pcmTo16k(pcmSlice(a0, PCM.total), PCM.sr));
+    try {
+        const fd = new FormData();
+        fd.append('model', SF_ASR_MODEL); fd.append('file', blob, 'voice.wav');
+        const r = await fetch(SF_ASR_URL(), { method: 'POST', headers: { 'Authorization': 'Bearer ' + SF_API_KEY }, body: fd });
+        const txt = await r.text();
+        console.log('[asrTest]', r.status, txt);
+        showSysToast('HTTP ' + r.status + ' ' + txt.slice(0, 70));
+        return r.status + ' ' + txt;
+    } catch (e) { showSysToast('❌ ' + e.message); return e.message; }
+};
 
 /* ---------- 你开口 / 你说完 ---------- */
 function onUserVoiceStart() {
@@ -7759,9 +8507,8 @@ function onUserVoiceEnd() {
     clearTimeout(REC.cutTimer);
     REC.cutTimer = setTimeout(() => {
         if (VAD.speaking || !REC.on) return;
-        if (REC.voiceMs >= MIC.minVoiceMs) recCut(true);   /* 够一句话 → 送识别 */
-        else recCut(false);                                /* 只是杂音 → 丢掉重开 */
-    }, 520);
+        recCut(recVoiceEnough());   /* 够一句话就送识别，纯杂音才丢掉重开 */
+    }, 160);
 }
 function recKick() {
     if (!recOn || !SR_CLS || recActive || !recObj) return;
@@ -7774,10 +8521,10 @@ function looksLikeEcho(t) {
     const clr = x => String(x).replace(/[\s，。、,.!?！？；;：:]/g, '');
     const s = clr(t); if (s.length < 2) return true;
     const ref = clr(SPEAK_ALL || SPEAK_NOW); if (!ref) return false;
-    if (ref.indexOf(s) >= 0) return true;
+    if (s.length >= 7 && ref.indexOf(s) >= 0) return true;
     let hit = 0, tot = 0;
     for (let i = 0; i + 2 <= s.length; i++) { tot++; if (ref.indexOf(s.substr(i, 2)) >= 0) hit++; }
-    return (tot > 0 && hit / tot > 0.52);
+    return (tot >= 4 && hit / tot > 0.72);
 }
 function isEcho(t) {
     if (!VC.set.barge) return true;
@@ -7789,10 +8536,9 @@ function isEcho(t) {
 function recStop() {
     recOn = false; recActive = false; clearTimeout(recTimer); recBuf = '';
     clearTimeout(REC.cutTimer); REC.busy = false; REC.hadVoice = false; REC.sendIt = false;
-    PTT.hold = false; REC.voiceMs = 0; REC.peak = 0; REC.overlap = false; REC.bargeOK = false;
+    PTT.hold = false; REC.voiceMs = 0; REC.softMs = 0; REC.peak = 0; REC.overlap = false; REC.bargeOK = false;
     VAD.voiceMs = 0; VAD.speaking = false;
-    try { if (REC.mr) { REC.mr.onstop = null; REC.mr.ondataavailable = null; if (REC.on) REC.mr.stop(); } } catch (e) {}
-    REC.on = false; REC.chunks = []; REC.mr = null;
+    REC.on = false;
     if (recObj) { try { recObj.onend = null; recObj.onresult = null; recObj.abort ? recObj.abort() : recObj.stop(); } catch (e) {} }
     recObj = null;
     vadStop(); vcMeter(0, 1); vcMicUI();
@@ -7803,12 +8549,13 @@ async function recStart() {
         vcStatus('○ 正在打开麦克风…');
         const ok = await vadStart();
         if (ok) {
-            recOn = true; vcMicUI();
+            recOn = true; REC.err = 0; vcMicUI();
             recOpen();
             vcStatus(VC.set.ptt ? '🎙 按住麦克风按钮说话' : '● 聆听中（直接说话就行）');
             return;
         }
-        vcStatus('⚠ 麦克风打不开 → 本次改用浏览器识别');
+        vcStatus('⚠ 麦克风打不开');
+        showSysToast('❌ 麦克风打不开：请在系统设置里给本 App / 浏览器 麦克风权限');
         RT_ASR_LOCAL = true;
     }
     /* ② 兜底：浏览器识别 */
@@ -7844,7 +8591,7 @@ async function recStart() {
             recTimer = setTimeout(() => {
                 const t = (recBuf + interim).trim();
                 recBuf = '';
-                if (asrTextOK(t) && (VC.set.ptt || asrIsAsk(t))) sendChat(t);
+                if (asrTextOK(t)) sendChat(t);
                 else vcStatus('● 聆听中');
             }, fin ? 620 : 950);
         };
@@ -8555,7 +9302,7 @@ async function buildContext(text) {
         parts.push(OPS_GUIDE);
     }
     if (_wantBuild) parts.push(STEP_HINT);
-    if (RX_NET.test(text)) {
+    if (RX_NET.test(text) && !RX_LAY.test(text) && !_wantBuild) {   /* ★ 造景/施工指导不必联网，直接秒答 */
         vcStatus('🌐 联网查资料…');
         const w = await webSearch(text);
         if (w) parts.push('【联网搜到的资料（' + new Date().toLocaleString('zh-CN') + '）】\n' + w);
@@ -8569,6 +9316,8 @@ async function buildContext(text) {
 /* ============ 五、调用硅基流动（OpenAI 兼容 · 流式 · 自动降级） ============ */
 /* ---------- 人物档案：谁问都答得出几岁、哪里来、谁做的 ---------- */
 const CHAR_PROFILE = {
+    '贵夫人·视频': { age: '妾身今年二十有四', from: '江南名门望族的深宅大院', self: '妾身是这园中的贵夫人',
+                  tone: '大家闺秀·贵夫人口吻：自称"妾身"，称对方"公子"，从容端庄、温婉有礼、不急不躁' },
     '观音':     { age: '我不按凡人的岁数算，若你一定要问，便是千百年了', from: '南海普陀山', self: '我是观音，自南海普陀而来',
                   tone: '自称"我"，称对方"施主"，沉稳柔和、慈悲庄严，偶尔一句"善哉"，绝不轻浮' },
     '唐代美人': { age: '妾身今年十九', from: '大唐长安城', self: '妾身是唐代美人，来自大唐长安',
@@ -8585,6 +9334,7 @@ const CHAR_PROFILE = {
 function charProf(name) { return CHAR_PROFILE[name] || CHAR_PROFILE._def; }
 /* ★ 各角色固定开场：点它接通时只说这一句，之后不提问绝不开口 */
 const CHAR_GREET = {
+    '贵夫人·视频': '【古风】妾身见过公子。这园子妾身也算熟稔，公子有话请讲。',
     '观音':     '【温柔】阿弥陀佛，施主你好，善哉善哉。',
     '唐代美人': '【古风】妾身见过公子。长安一别千年，今日与公子相逢于此，公子有话请讲。',
     '古装美人': '【古风】妾身见过公子。长安一别千年，今日与公子相逢于此，公子有话请讲。',
@@ -8899,8 +9649,8 @@ function ensureVCUI() {
             '<input type="range" id="vc-vol" min="0.5" max="3" step="0.1"></div>' +
         '<div class="vc-r"><label>📝 回答长度</label><select id="vc-len">' +
             '<option value="short">简短（2~4句，适合语音）</option><option value="long">详细</option></select></div>' +
-        '<div class="vc-r"><label>🎚 麦克风灵敏度 <span id="vc-sens-v">0.032</span>（数值越大越不容易误触发）</label>' +
-            '<input type="range" id="vc-sens" min="0.012" max="0.100" step="0.002"></div>' +
+        '<div class="vc-r"><label>🎚 麦克风灵敏度 <span id="vc-sens-v">0.009</span>（越小越灵敏，嘈杂环境往大调）</label>' +
+            '<input type="range" id="vc-sens" min="0.003" max="0.100" step="0.001"></div>' +
         '<div class="vc-sw" id="vc-sw-ptt">🎙 按住说话（嘈杂环境最保险） <b>关</b></div>' +
         '<div class="vc-sw" id="vc-sw-barge">✋ 我一开口就打断人物 <b>开</b></div>' +
         '<div class="vc-sw" id="vc-sw-emo">🎭 说话带情绪（开心/温柔/撒娇…） <b>开</b></div>' +
@@ -9071,9 +9821,8 @@ function ensureVCUI() {
 }
 
 /* ================= 七、接通 / 挂断 ================= */
-function openChatPanel(obj) {          // 名字保持不变：原来的"轻点人物"代码无需修改
-    CHAT_TAP_TS = Date.now();          /* ★ 打上时间戳：这一下点击绝不会再放置出第二个人物 */
-    try { enforceSinglePerson(obj); } catch (e) {}   /* ★ 顺手铲掉任何多出来的/删不掉的人物 */
+function openChatPanel(obj) {          // 轻点任意一位人物 → 直接切到她，其余人物一个都不动
+    CHAT_TAP_TS = Date.now();
     ensureVCUI();
     const same = (chatTarget === obj);
     /* ★ 通话中再轻点这个人物一下 → 立刻掐断她的话，马上换你说 */
@@ -9086,14 +9835,14 @@ function openChatPanel(obj) {          // 名字保持不变：原来的"轻点�
         if (!recOn) recStart(); else recKick();
         return;
     }
-    if (!same) { ttsStop(); vcSub(''); }
+    if (!same) { ttsStop(); vcSub(''); talkResetRig(TALK.rig); }
     chatTarget = obj;
     if (!obj.userData._chatLog) obj.userData._chatLog = [];    // 每个人物独立记忆
     TALK.rig = buildTalkRig(obj);
     VC.on = true;
     RT_TTS_LOCAL = false; RT_ASR_LOCAL = false;   // ★ 每次接通都重新优先用云端
     document.getElementById('vc-bar').classList.add('on');
-    document.getElementById('vc-who').innerText = characterName(obj);
+    document.getElementById('vc-who').innerText = chatLabel(obj);
     const _fab = document.getElementById('vc-fab');
     if (_fab) _fab.classList.add('on');
     vcBarHide(false);
@@ -9106,8 +9855,8 @@ function openChatPanel(obj) {          // 名字保持不变：原来的"轻点�
     if (VC.set.share && !VIS.on) visStart();
 
     if (!same) {
-          if (!GREETED[characterName(obj)]) {                                  // ★首次自介：全幻境仅一次
-            GREETED[characterName(obj)] = 1;
+          if (!obj.userData._greeted) {                                        // ★每位人物各自问候一次
+            obj.userData._greeted = 1;
             const g = greetLine(characterName(obj));
             obj.userData._chatLog.push({ role: 'assistant', content: g });
             recGuardTo = Date.now() + 420;
@@ -9125,6 +9874,7 @@ function closeChatPanel() {
     const b = document.getElementById('vc-bar'); if (b) b.classList.remove('on');
     const c = document.getElementById('vc-set'); if (c) c.classList.remove('on');
     const r = document.getElementById('vc-row'); if (r) r.style.display = 'none';
+    talkResetRig(TALK.rig);
     chatTarget = null; TALK.rig = null;
     showSysToast('📞 已挂断语音通话');
 }
@@ -9143,11 +9893,13 @@ async function sendChat(text, hidden) {
     vcStatus('○ 思考中…');
     if (VC.set.sub && !hidden) vcSub('（我：' + text + '）');
     let ctx = '', imgs = [];
-    if (VIS.on) {                                  /* ★ 共享开启 → 抓此刻高清画面，随问题一起发给她 */
+    /* ★2026.10：只有"真的在问画面/现场/造景"时才抓图，否则纯文字模型秒回，聊天不再卡 1~2 秒 */
+    const _wantSee = VIS.on && (RX_VIS.test(text) || RX_LAY.test(text) || RX_BUILD.test(text) ||
+        /(这里|这儿|那儿|现场|场地|环境|周围|院子|庭院|门口|墙|地面|房子|阳台|天台)/.test(text));
+    if (_wantSee) {
         vcStatus('👀 正在看画面…');
-        try { imgs = await visCapture(true); } catch (e) { imgs = []; }
+        try { imgs = await visCapture(RX_VIS.test(text)); } catch (e) { imgs = []; }
         if (my !== chatToken) { VC.busy = false; return; }
-        /* 不是明显在问细节的问题就只带一张全景图，省流量省时间 */
         if (imgs.length > 1 && !RX_VIS.test(text)) imgs = [imgs[0]];
     }
     try { ctx = await buildContext(text); } catch (e) { ctx = ''; }
@@ -9213,7 +9965,6 @@ async function sendChat(text, hidden) {
 /* ====================== 3D 人物语音通话模块 v2 结束 ====================== */
 initAR();
 </script>
-
 </body>
 </html>
 
