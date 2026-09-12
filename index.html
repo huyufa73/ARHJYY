@@ -723,7 +723,6 @@ const ASSETS = {
     object: [
         
         { id: 'vchar_GuiFuRen', name: '贵夫人·视频', icon: '🎬' },
-        { id: 'vchar_GuiFuRen', name: '贵夫人·视频', icon: '🎬' },
         { id: 'lily_white_pink', name: '写实睡莲·白粉', icon: '🪷' },
         { id: 'lily_purple',     name: '写实睡莲·紫',   icon: '💜' },
         { id: 'lily_rose',       name: '写实睡莲·粉',   icon: '🌸' },
@@ -767,33 +766,69 @@ const VCHAR_BASES = [
     'https://media.githubusercontent.com/media/huyufa73/ARHJYY/main/',
     'https://raw.githubusercontent.com/huyufa73/ARHJYY/main/'
 ];
-/* 想再加视频人物：照抄一行改 id / name / file 即可，其它代码一个字都不用动 */
+/* 想再加视频人物：照抄一行改 id / name / file 即可，其它代码一个字都不用动
+   file     = 首选：带真透明通道的 webm（VP9/VP8 + alpha）
+   alt      = iOS 备选：HEVC 带 alpha 的 .mov（没有就自动跳过）
+   fallback = 最后兜底：蓝幕/绿幕 mp4，走原来的 GPU 抠像                */
 const VIDEO_CHARS = [
     { id: 'vchar_GuiFuRen', cat: 'cat_renwu', name: '贵夫人·视频', icon: '🎬',
-      file: 'Videos/Gui Fu Ren/Gui Fu Ren.mp4', isVideo: true, realHeight: 1.68 }
+      file:     'Videos/Gui Fu Ren/Gui Fu Ren-alpha.webm',
+      alt:      'Videos/Gui Fu Ren/Gui Fu Ren-alpha.mov',
+      fallback: 'Videos/Gui Fu Ren/Gui Fu Ren.mp4',
+      isVideo: true, realHeight: 1.68 }
 ];
 VIDEO_CHARS.forEach(v => { if (!CLOUD_MODELS.some(m => m.id === v.id)) CLOUD_MODELS.push(v); });
 
+/* unpremul : 若人物边缘发黑/发灰 → vcharTune({unpremul:1})
+   edge     : 收边（去半透明毛边），0.02~0.14 之间调
+   alphaCut : 低于这个透明度直接丢弃像素，越大越干净但边缘越硬 */
 const VCHAR_TUNE = { height: 1.68, sim: 0.22, smooth: 0.16, spill: 0.65, opacity: 1.0,
-                     idleRate: 0, idleTime: 0, crop: null, key: null, yawFix: 0 };
+                     idleRate: 0, idleTime: 0, crop: null, key: null, yawFix: 0,
+                     unpremul: 0, edge: 0.05, alphaCut: 0.05 };
 const VCHAR_CACHE = {};
 let VCHAR_LIST = [];
 let VCHAR_URL_FIX = '';
 let _vcLightEl = null;
 const _vcCamPos = new THREE.Vector3(), _vcObjPos = new THREE.Vector3();
 
-/* ---------- ① 文件名/网址自动试探 ---------- */
+/* ---------- ① 本机能不能播这种格式 ---------- */
+function vcharCan(kind) {
+    try {
+        const v = document.createElement('video');
+        if (kind === 'webm')
+            return !!(v.canPlayType('video/webm; codecs="vp9"') ||
+                      v.canPlayType('video/webm; codecs="vp8, vorbis"') ||
+                      v.canPlayType('video/webm'));
+        if (kind === 'hevc')
+            return !!(v.canPlayType('video/quicktime') ||
+                      v.canPlayType('video/mp4; codecs="hvc1"') ||
+                      v.canPlayType('video/mp4; codecs="hev1"'));
+        return true;
+    } catch (e) { return true; }
+}
+/* ---------- ① 文件名/网址自动试探（大小写、空格、下划线、-alpha 全兼容） ---------- */
 function vcharFiles(file) {
     const out = [];
     const push = s => { if (s && out.indexOf(s) < 0) out.push(s); };
     const i = file.lastIndexOf('/');
     const dir = file.slice(0, i + 1), nm = file.slice(i + 1);
-    const stem = nm.replace(/\.[^.]+$/, '');
+    const stem0 = nm.replace(/\.[^.]+$/, '');
+    const ext0 = (nm.match(/\.[^.]+$/) || ['.webm'])[0];
+    const base = stem0.replace(/[-_ ]?alpha$/i, '');            /* 去掉 -alpha 得到原名 */
     const dirs = [dir, dir.replace(/ /g, '_'), dir.replace(/ /g, ''),
                   dir.toLowerCase(), dir.replace(/ /g, '').toLowerCase()];
-    const stems = [stem, stem.replace(/ /g, '_'), stem.replace(/ /g, ''),
-                   stem.toLowerCase(), stem.replace(/ /g, '').toLowerCase(), '贵夫人'];
-    const exts = ['.mp4', '.MP4', '.webm', '.mov'];
+    const stems = [];
+    [stem0, base + '-alpha', base + '_alpha', base + ' alpha', base + 'alpha',
+     base, '贵夫人-alpha', '贵夫人_alpha', '贵夫人'].forEach(s => {
+        [s, s.replace(/ /g, '_'), s.replace(/ /g, ''),
+         s.toLowerCase(), s.replace(/ /g, '').toLowerCase()].forEach(x => {
+            if (x && stems.indexOf(x) < 0) stems.push(x);
+        });
+    });
+    /* 关键：webm 只试 webm，mp4/mov 只试 mp4/mov → 三级降级链互不串味 */
+    const exts = /webm$/i.test(ext0) ? ['.webm', '.WEBM']
+               : (/mov$/i.test(ext0) ? ['.mov', '.MOV', '.mp4', '.MP4']
+                                     : ['.mp4', '.MP4', '.mov', '.MOV']);
     dirs.forEach(d => stems.forEach(s => exts.forEach(e => push(d + s + e))));
     return out;
 }
@@ -813,14 +848,18 @@ async function vcharProbe(urls, batch) {
     }
     return '';
 }
-async function vcharFindURL(asset) {
-    if (VCHAR_URL_FIX) return VCHAR_URL_FIX;
-    if (asset._vurl) return asset._vurl;
-    const files = vcharFiles(asset.file);
+async function vcharFindURL(asset, which) {
+    const w = which || 'main';
+    const key  = (w === 'main') ? '_vurl' : (w === 'alt' ? '_vurlA' : '_vurlF');
+    const file = (w === 'main') ? asset.file : (w === 'alt' ? asset.alt : asset.fallback);
+    if (!file) return '';
+    if (w === 'main' && VCHAR_URL_FIX) return VCHAR_URL_FIX;
+    if (asset[key]) return asset[key];
+    const files = vcharFiles(file);
     for (let b = 0; b < VCHAR_BASES.length; b++) {
         const list = files.map(f => VCHAR_BASES[b] + encodeURI(f));
         const hit = await vcharProbe(list, 8);
-        if (hit) { asset._vurl = hit; return hit; }
+        if (hit) { asset[key] = hit; return hit; }
     }
     return '';
 }
@@ -852,6 +891,10 @@ function vcharMat(box) {
     return new THREE.ShaderMaterial({
         uniforms: {
             uMap:     { value: box.tex },
+            uAlpha:   { value: (box && box.hasAlpha) ? 1.0 : 0.0 },  /* 1=视频自带透明通道 */
+            uUnpre:   { value: VCHAR_TUNE.unpremul ? 1.0 : 0.0 },    /* 边缘发黑时改 1 */
+            uEdge:    { value: VCHAR_TUNE.edge },
+            uCut:     { value: VCHAR_TUNE.alphaCut },
             uKey:     { value: new THREE.Vector3(k[0], k[1], k[2]) },
             uKeyCC:   { value: new THREE.Vector2(cc[0], cc[1]) },
             uSim:     { value: VCHAR_TUNE.sim },
@@ -874,28 +917,40 @@ function vcharMat(box) {
             uniform vec3  uKey;
             uniform vec2  uKeyCC;
             uniform float uSim, uSmooth, uSpill, uOpacity, uBright;
+            uniform float uAlpha, uUnpre, uEdge, uCut;
             varying vec2 vUv;
             vec2 cbcr(vec3 c){
                 float y = dot(c, vec3(0.299, 0.587, 0.114));
                 return vec2(0.5643 * (c.b - y), 0.7133 * (c.r - y));
             }
             void main(){
-                vec4 t  = texture2D(uMap, vUv);
-                vec3 c  = t.rgb;
-                vec3 cn = c / max(0.02, max(c.r, max(c.g, c.b)));
-                float d = distance(cbcr(cn), uKeyCC);
-                float a = smoothstep(uSim, uSim + max(uSmooth, 0.002), d);
-                if (uKey.b >= uKey.g) {
-                    float sp = max(0.0, c.b - max(c.r, c.g));
-                    c.b -= sp * uSpill;
-                    c.g += sp * uSpill * 0.18;
+                vec4  t = texture2D(uMap, vUv);
+                vec3  c = t.rgb;
+                float a;
+                if (uAlpha > 0.5) {
+                    /* ★★ 真透明通道：完全不抠像，发丝/薄纱都保留 ★★ */
+                    a = t.a;
+                    vec3 cs = c / max(a, 0.004);          /* 预乘修正（边缘发黑才用） */
+                    c = mix(c, cs, uUnpre);
+                    a = clamp((a - uEdge) / max(0.0001, 1.0 - uEdge), 0.0, 1.0);  /* 收掉毛边 */
                 } else {
-                    float sp = max(0.0, c.g - max(c.r, c.b));
-                    c.g -= sp * uSpill;
+                    /* 兜底：蓝幕/绿幕自动抠像（原逻辑，一字未改） */
+                    vec3 cn = c / max(0.02, max(c.r, max(c.g, c.b)));
+                    float d = distance(cbcr(cn), uKeyCC);
+                    a = smoothstep(uSim, uSim + max(uSmooth, 0.002), d);
+                    if (uKey.b >= uKey.g) {
+                        float sp = max(0.0, c.b - max(c.r, c.g));
+                        c.b -= sp * uSpill;
+                        c.g += sp * uSpill * 0.18;
+                    } else {
+                        float sp = max(0.0, c.g - max(c.r, c.b));
+                        c.g -= sp * uSpill;
+                    }
+                    c *= mix(0.88, 1.0, a);
+                    a *= t.a;
                 }
-                c *= mix(0.88, 1.0, a);
-                float al = a * t.a * uOpacity;
-                if (al < 0.10) discard;
+                float al = a * uOpacity;
+                if (al < uCut) discard;
                 gl_FragColor = vec4(clamp(c * uBright, 0.0, 1.0), al);
             }`,
         transparent: true, side: THREE.DoubleSide, depthWrite: true, depthTest: true
@@ -926,27 +981,67 @@ function vcharAutoKey(box) {
     } catch (e) {}
 }
 
-/* ---------- ④ 加载视频（同一个人物全场共用一份，手机不吃力） ---------- */
+/* ---------- ④ 加载视频：透明 webm 优先，失败自动退回 mov / 蓝幕 mp4 ---------- */
+/* 返回 1=确定自带透明通道  0=确定没有(需抠像)  -1=读不出来(保持当前判断) */
+function vcharAlphaProbe(box) {
+    try {
+        const v = box.video;
+        if (!v || !v.videoWidth || v.readyState < 2) return -1;
+        const W = 44, H = 44, n = W * H;
+        if (!box.acv) {
+            box.acv = document.createElement('canvas');
+            box.actx = box.acv.getContext('2d', { willReadFrequently: true });
+        }
+        box.acv.width = W; box.acv.height = H;
+        box.actx.clearRect(0, 0, W, H);
+        box.actx.drawImage(v, 0, 0, W, H);
+        const d = box.actx.getImageData(0, 0, W, H).data;
+        let mn = 255, tr = 0, op = 0;
+        for (let i = 3; i < d.length; i += 4) {
+            const a = d[i];
+            if (a < mn) mn = a;
+            if (a < 250) tr++;
+            if (a > 250) op++;
+        }
+        if (op < n * 0.02) return -1;                      /* 整帧都空 → 这帧根本没画进来 */
+        return (mn < 240 && tr > n * 0.02) ? 1 : 0;
+    } catch (e) { return -1; }                             /* 跨域被污染 → 不改判断 */
+}
 function vcharGet(id, cb) {
     const c = VCHAR_CACHE[id];
     if (c && c.ready) { cb(c); return; }
     if (c && c.waits) { c.waits.push(cb); return; }
     const asset = CLOUD_MODELS.find(a => a.id === id);
     if (!asset) return;
-    const box = { waits: [cb], ready: false, rate: 0, fresh: 0 };
+    const box = { waits: [cb], ready: false, rate: 0, fresh: 0, hasAlpha: true };
     VCHAR_CACHE[id] = box;
     const toast = document.getElementById('loading-toast');
+    toast.style.maxWidth = ''; toast.style.whiteSpace = '';
     toast.style.display = 'block';
     toast.innerText = '正在载入视频人物：' + asset.name + '…';
-    (async () => {
-        const url = await vcharFindURL(asset);
-        if (!url) {
-            delete VCHAR_CACHE[id];
-            toast.style.maxWidth = '90vw'; toast.style.whiteSpace = 'pre-wrap';
-            toast.innerText = '❌ 没找到视频文件\n请确认 ARHJYY/Videos/Gui Fu Ren/ 里有 mp4\n或在控制台敲 vcharDiag() 体检';
-            setTimeout(() => { toast.style.display = 'none'; }, 12000);
+
+    const CHAIN = ['main', 'alt', 'fallback'];
+    const fileOf = w => (w === 'main' ? asset.file : (w === 'alt' ? asset.alt : asset.fallback));
+    const fail = (msg) => {
+        delete VCHAR_CACHE[id];
+        toast.style.maxWidth = '90vw'; toast.style.whiteSpace = 'pre-wrap';
+        toast.style.display = 'block';
+        toast.innerText = msg;
+        setTimeout(() => { toast.style.display = 'none'; }, 14000);
+    };
+    const boot = async (w) => {
+        if (!w) {
+            fail('❌ 没找到能播的视频\n请确认仓库里有：\nVideos/Gui Fu Ren/Gui Fu Ren-alpha.webm\n（iOS 另需 -alpha.mov 或 Gui Fu Ren.mp4）\n控制台敲 vcharDiag() 可体检');
             return;
         }
+        const nxt  = CHAIN[CHAIN.indexOf(w) + 1] || '';
+        const file = fileOf(w);
+        if (!file) { boot(nxt); return; }
+        if (w === 'main' && !vcharCan('webm')) { boot(nxt); return; }   /* iOS 不支持 webm，直接跳 */
+        if (w === 'alt'  && !vcharCan('hevc')) { boot(nxt); return; }
+        const url = await vcharFindURL(asset, w);
+        if (!url) { boot(nxt); return; }
+
         const v = document.createElement('video');
         v.crossOrigin = 'anonymous';
         v.loop = true; v.muted = true; v.defaultMuted = true; v.volume = 0;
@@ -954,36 +1049,55 @@ function vcharGet(id, cb) {
         v.setAttribute('playsinline', ''); v.setAttribute('webkit-playsinline', ''); v.setAttribute('muted', '');
         v.style.cssText = 'position:fixed;left:0;bottom:0;width:2px;height:2px;opacity:0.01;pointer-events:none;z-index:-1;';
         document.body.appendChild(v);
-        v.src = url;
+
+        let settled = false;
+        const giveUp = (why) => {
+            if (settled || box.ready) return;
+            settled = true;
+            try { v.pause(); } catch (e) {}
+            try { if (v.parentNode) v.parentNode.removeChild(v); } catch (e) {}
+            if (nxt) { toast.innerText = '本机播不了这个格式，改用备用视频…'; boot(nxt); }
+            else fail('❌ 视频加载失败\n' + url + '\n' + (why || ''));
+        };
         const done = () => {
-            if (box.ready) return;
+            if (settled || box.ready) return;
             if (!v.videoWidth) return;
+            settled = true;
             box.ready = true;
-            box.video = v;
+            box.video = v; box.url = url; box.kind = w;
             box.aspect = v.videoWidth / v.videoHeight;
             const tex = new THREE.Texture(v);          /* 手动控制上传：暂停时零开销 */
             tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter;
             tex.generateMipmaps = false;
             tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+            tex.premultiplyAlpha = false;
             tex.needsUpdate = true;
             box.tex = tex; box.fresh = 12;
+            box.hasAlpha = (w !== 'fallback');          /* webm/mov 认为自带 alpha，mp4 走抠像 */
+            const pr0 = vcharAlphaProbe(box);
+            if (pr0 === 1) box.hasAlpha = true;
+            else if (pr0 === 0) box.hasAlpha = false;
             toast.style.display = 'none';
-            const w = box.waits || []; box.waits = null;
-            w.forEach(f => { try { f(box); } catch (e) {} });
-            setTimeout(() => vcharAutoKey(box), 350);
+            const q = box.waits || []; box.waits = null;
+            q.forEach(f => { try { f(box); } catch (e) {} });
+            /* 首帧解码可能晚一点：再复核两次，确定要不要抠像 */
+            const recheck = () => {
+                const r = vcharAlphaProbe(box);
+                if (r === 1 && !box.hasAlpha) { box.hasAlpha = true; vcharApplyAll(false); }
+                else if (r === 0 && box.hasAlpha) { box.hasAlpha = false; vcharApplyAll(false); vcharAutoKey(box); }
+                else if (r === 0 && !box.hasAlpha) vcharAutoKey(box);
+            };
+            setTimeout(recheck, 420);
+            setTimeout(recheck, 1500);
         };
         v.addEventListener('loadeddata', done);
         v.addEventListener('canplay', done);
-        v.addEventListener('error', () => {
-            if (box.ready) return;
-            delete VCHAR_CACHE[id];
-            toast.style.maxWidth = '90vw'; toast.style.whiteSpace = 'pre-wrap';
-            toast.innerText = '❌ 视频加载失败\n' + url + '\n（建议 H.264 编码、20MB 以内）';
-            setTimeout(() => { toast.style.display = 'none'; }, 12000);
-        });
+        v.addEventListener('error', () => giveUp('（webm 请用 VP9+alpha；iOS 请配 HEVC-alpha 的 .mov 或蓝幕 mp4）'));
+        v.src = url;
         try { const p = v.play(); if (p && p.catch) p.catch(() => {}); } catch (e) {}
-        setTimeout(done, 2500);
-    })();
+        setTimeout(() => { if (!box.ready && !settled) { if (v.videoWidth) done(); else giveUp('（下载/解码超时）'); } }, 7000);
+    };
+    boot('main');
 }
 
 /* ---------- ⑤ 建人物（面片 + 脚下柔和阴影 + 隐形点选盒） ---------- */
@@ -1029,6 +1143,10 @@ function vcharApplyAll(geomToo) {
         u.uSmooth.value = VCHAR_TUNE.smooth;
         u.uSpill.value = VCHAR_TUNE.spill;
         u.uOpacity.value = VCHAR_TUNE.opacity;
+        if (u.uAlpha) u.uAlpha.value = (box && box.hasAlpha) ? 1.0 : 0.0;
+        if (u.uUnpre) u.uUnpre.value = VCHAR_TUNE.unpremul ? 1.0 : 0.0;
+        if (u.uEdge)  u.uEdge.value  = VCHAR_TUNE.edge;
+        if (u.uCut)   u.uCut.value   = VCHAR_TUNE.alphaCut;
         if (geomToo) vcharApplyGeom(o);
     }
 }
@@ -1129,19 +1247,39 @@ animatedTrees.push({ uniforms: { uTime: { get value() { return 0; },
 window.vcharTune = function (o) { Object.assign(VCHAR_TUNE, o || {}); vcharApplyAll(true); return VCHAR_TUNE; };
 window.setVideoCharURL = function (u) {
     VCHAR_URL_FIX = u || '';
-    VIDEO_CHARS.forEach(v => { delete v._vurl; });
+    VIDEO_CHARS.forEach(v => { delete v._vurl; delete v._vurlA; delete v._vurlF; });
     for (const k in VCHAR_CACHE) delete VCHAR_CACHE[k];
     showSysToast(u ? '✅ 已指定视频网址，请重新放置人物' : '已清除指定网址');
     return VCHAR_URL_FIX;
 };
+/* 当前用的是哪一个视频、有没有真透明通道 */
+window.vcharInfo = function () {
+    const out = [];
+    out.push('本机支持 webm-alpha：' + (vcharCan('webm') ? '是' : '否') +
+             '　支持 HEVC-alpha：' + (vcharCan('hevc') ? '是' : '否'));
+    for (const k in VCHAR_CACHE) {
+        const b = VCHAR_CACHE[k];
+        out.push(k + ' → ' + (b.kind || '?') + '　' + (b.hasAlpha ? '✅真透明通道' : '⚠️蓝幕抠像') +
+                 '　' + (b.video ? (b.video.videoWidth + '×' + b.video.videoHeight) : '未就绪') +
+                 '\n' + (b.url || ''));
+    }
+    const s = out.join('\n');
+    console.log(s); showSysToast(s.slice(0, 95)); return s;
+};
 window.vcharDiag = async function () {
     const a = CLOUD_MODELS.find(x => x.id === 'vchar_GuiFuRen');
-    const files = vcharFiles(a.file).slice(0, 24);
-    const out = [];
-    for (let b = 0; b < 2; b++) for (let i = 0; i < files.length; i++) {
-        const u = VCHAR_BASES[b] + encodeURI(files[i]);
-        try { const r = await fetch(u, { method: 'HEAD' }); out.push((r.ok ? '✅ ' : ('❌' + r.status + ' ')) + u); }
-        catch (e) { out.push('❌网络 ' + u); }
+    const jobs = [['①透明webm', a.file], ['②HEVC.mov', a.alt], ['③蓝幕mp4', a.fallback]];
+    const out = ['支持 webm-alpha：' + (vcharCan('webm') ? '是' : '否') +
+                 '　支持 HEVC-alpha：' + (vcharCan('hevc') ? '是' : '否')];
+    for (let j = 0; j < jobs.length; j++) {
+        if (!jobs[j][1]) continue;
+        out.push('—— ' + jobs[j][0] + ' ——');
+        const files = vcharFiles(jobs[j][1]).slice(0, 16);
+        for (let b = 0; b < 2; b++) for (let i = 0; i < files.length; i++) {
+            const u = VCHAR_BASES[b] + encodeURI(files[i]);
+            try { const r = await fetch(u, { method: 'HEAD' }); out.push((r.ok ? '✅ ' : ('❌' + r.status + ' ')) + u); }
+            catch (e) { out.push('❌网络 ' + u); }
+        }
     }
     console.log(out.join('\n'));
     showSysToast((out.find(x => x.indexOf('✅') === 0) || '全部失败，请看控制台').slice(0, 90));
@@ -7454,6 +7592,7 @@ function faceMarks(obj, rig) {
 }
 function buildTalkRig2(obj) {
     if (obj.userData._talkRig) return obj.userData._talkRig;
+    if (obj.userData.isVideoChar) return null;   /* ★ 视频人物：口型来自视频，不做顶点变形 */
     try {
         obj.updateMatrixWorld(true);
         const inv = new THREE.Matrix4().copy(obj.matrixWorld).invert();
