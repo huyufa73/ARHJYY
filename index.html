@@ -782,14 +782,26 @@ VIDEO_CHARS.forEach(v => { if (!CLOUD_MODELS.some(m => m.id === v.id)) CLOUD_MOD
 /* unpremul : 若人物边缘发黑/发灰 → vcharTune({unpremul:1})
    edge     : 收边（去半透明毛边），0.02~0.14 之间调
    alphaCut : 低于这个透明度直接丢弃像素，越大越干净但边缘越硬 */
-const VCHAR_TUNE = { height: 1.68, sim: 0.22, smooth: 0.16, spill: 0.65, opacity: 1.0,
-                     idleRate: 0, idleTime: 0, crop: null, key: null, yawFix: 0,
-                     unpremul: 0, edge: 0.05, alphaCut: 0.05 };
+const VCHAR_TUNE = { height: 1.68, sim: 0.30, smooth: 0.18, spill: 0.78, opacity: 1.0,
+                     idleRate: 0.22, idleTime: 0.60, crop: null, key: null, yawFix: 0,
+                     unpremul: -1, edge: 0.04, alphaCut: 0.04, mode: 'key' };
 const VCHAR_CACHE = {};
 let VCHAR_LIST = [];
 let VCHAR_URL_FIX = '';
 let _vcLightEl = null;
 const _vcCamPos = new THREE.Vector3(), _vcObjPos = new THREE.Vector3();
+/* ★★ 安卓机型差异极大，这两个小函数就是「永不黑屏」的关键 ★★
+   mode     : 'auto'=自动判断  'alpha'=强制用视频透明通道  'key'=强制蓝幕抠像
+   unpremul : -1=自动（推荐）  1=强制除回预乘(边缘发黑时)  0=强制不处理 */
+function vcHasAlpha(box) {
+    if (VCHAR_TUNE.mode === 'alpha') return true;
+    if (VCHAR_TUNE.mode === 'key')   return false;
+    return !!(box && box.hasAlpha);
+}
+function vcUnpre(box) {
+    if (VCHAR_TUNE.unpremul >= 0) return VCHAR_TUNE.unpremul ? 1.0 : 0.0;
+    return (box && box.preMul) ? 1.0 : 0.0;
+}
 
 /* ---------- ① 本机能不能播这种格式 ---------- */
 function vcharCan(kind) {
@@ -891,8 +903,8 @@ function vcharMat(box) {
     return new THREE.ShaderMaterial({
         uniforms: {
             uMap:     { value: box.tex },
-            uAlpha:   { value: (box && box.hasAlpha) ? 1.0 : 0.0 },  /* 1=视频自带透明通道 */
-            uUnpre:   { value: VCHAR_TUNE.unpremul ? 1.0 : 0.0 },    /* 边缘发黑时改 1 */
+            uAlpha:   { value: vcHasAlpha(box) ? 1.0 : 0.0 },         /* 1=视频自带透明通道 */
+            uUnpre:   { value: vcUnpre(box) },                        /* 自动修正预乘发黑 */
             uEdge:    { value: VCHAR_TUNE.edge },
             uCut:     { value: VCHAR_TUNE.alphaCut },
             uKey:     { value: new THREE.Vector3(k[0], k[1], k[2]) },
@@ -1007,6 +1019,34 @@ function vcharAlphaProbe(box) {
         return (mn < 240 && tr > n * 0.02) ? 1 : 0;
     } catch (e) { return -1; }                             /* 跨域被污染 → 不改判断 */
 }
+/* 这帧颜色是不是"已乘过 alpha"（安卓 Chrome 老毛病 → 人物边缘/暗部发黑）
+   预乘: 颜色值恒 ≤ alpha 值；直通: 亮部会明显亮过 alpha 值 */
+function vcharPremulProbe(box) {
+    try {
+        const v = box.video;
+        if (!v || !v.videoWidth || v.readyState < 2) return !!box.preMul;
+        const W = 96, H = 96;
+        if (!box.pcv) {
+            box.pcv = document.createElement('canvas');
+            box.pctx = box.pcv.getContext('2d', { willReadFrequently: true });
+        }
+        box.pcv.width = W; box.pcv.height = H;
+        box.pctx.clearRect(0, 0, W, H);
+        box.pctx.drawImage(v, 0, 0, W, H);
+        const d = box.pctx.getImageData(0, 0, W, H).data;
+        let pre = 0, str = 0;
+        for (let i = 0; i < d.length; i += 4) {
+            const a = d[i + 3];
+            if (a < 26 || a > 224) continue;                /* 只看半透明的边缘像素 */
+            const mx = Math.max(d[i], Math.max(d[i + 1], d[i + 2]));
+            if (mx > a + 14) str++;
+            else if (mx < a - 6) pre++;
+        }
+        if (pre + str < 24) return !!box.preMul;            /* 样本太少 → 保持原判断 */
+        box.preMul = (pre > str * 1.6);
+        return box.preMul;
+    } catch (e) { return !!box.preMul; }
+}
 function vcharGet(id, cb) {
     const c = VCHAR_CACHE[id];
     if (c && c.ready) { cb(c); return; }
@@ -1020,7 +1060,7 @@ function vcharGet(id, cb) {
     toast.style.display = 'block';
     toast.innerText = '正在载入视频人物：' + asset.name + '…';
 
-    const CHAIN = ['main', 'alt', 'fallback'];
+    const CHAIN = ['fallback', 'main', 'alt'];
     const fileOf = w => (w === 'main' ? asset.file : (w === 'alt' ? asset.alt : asset.fallback));
     const fail = (msg) => {
         delete VCHAR_CACHE[id];
@@ -1066,7 +1106,12 @@ function vcharGet(id, cb) {
             box.ready = true;
             box.video = v; box.url = url; box.kind = w;
             box.aspect = v.videoWidth / v.videoHeight;
-            const tex = new THREE.Texture(v);          /* 手动控制上传：暂停时零开销 */
+            /* ★★ 安卓 Chrome 关键修复：video 直接当 WebGL 贴图会整块变黑，
+               改成每帧把 video 画到 canvas 上、再用 CanvasTexture 上传 → 必出画面 ★★ */
+            const vcv = document.createElement('canvas');
+            vcv.width = v.videoWidth || 640; vcv.height = v.videoHeight || 360;
+            box.drawCv = vcv; box.drawCtx = vcv.getContext('2d');
+            const tex = new THREE.CanvasTexture(vcv);
             tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter;
             tex.generateMipmaps = false;
             tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
@@ -1081,11 +1126,20 @@ function vcharGet(id, cb) {
             const q = box.waits || []; box.waits = null;
             q.forEach(f => { try { f(box); } catch (e) {} });
             /* 首帧解码可能晚一点：再复核两次，确定要不要抠像 */
+            let told = 0;
             const recheck = () => {
                 const r = vcharAlphaProbe(box);
-                if (r === 1 && !box.hasAlpha) { box.hasAlpha = true; vcharApplyAll(false); }
-                else if (r === 0 && box.hasAlpha) { box.hasAlpha = false; vcharApplyAll(false); vcharAutoKey(box); }
-                else if (r === 0 && !box.hasAlpha) vcharAutoKey(box);
+                if (r === 1) box.hasAlpha = true;
+                else if (r === 0) box.hasAlpha = false;
+                if (box.hasAlpha) vcharPremulProbe(box);
+                else vcharAutoKey(box);
+                vcharApplyAll(false);
+                if (!told && r !== -1) {
+                    told = 1;
+                    showSysToast('🎬 ' + (box.hasAlpha
+                        ? ('透明通道 ✅' + (box.preMul ? '（已自动修正发黑）' : ''))
+                        : '本机读不到透明通道 → 已自动改蓝幕抠像'));
+                }
             };
             setTimeout(recheck, 420);
             setTimeout(recheck, 1500);
@@ -1097,7 +1151,7 @@ function vcharGet(id, cb) {
         try { const p = v.play(); if (p && p.catch) p.catch(() => {}); } catch (e) {}
         setTimeout(() => { if (!box.ready && !settled) { if (v.videoWidth) done(); else giveUp('（下载/解码超时）'); } }, 7000);
     };
-    boot('main');
+boot('fallback');
 }
 
 /* ---------- ⑤ 建人物（面片 + 脚下柔和阴影 + 隐形点选盒） ---------- */
@@ -1143,8 +1197,8 @@ function vcharApplyAll(geomToo) {
         u.uSmooth.value = VCHAR_TUNE.smooth;
         u.uSpill.value = VCHAR_TUNE.spill;
         u.uOpacity.value = VCHAR_TUNE.opacity;
-        if (u.uAlpha) u.uAlpha.value = (box && box.hasAlpha) ? 1.0 : 0.0;
-        if (u.uUnpre) u.uUnpre.value = VCHAR_TUNE.unpremul ? 1.0 : 0.0;
+        if (u.uAlpha) u.uAlpha.value = vcHasAlpha(box) ? 1.0 : 0.0;
+        if (u.uUnpre) u.uUnpre.value = vcUnpre(box);
         if (u.uEdge)  u.uEdge.value  = VCHAR_TUNE.edge;
         if (u.uCut)   u.uCut.value   = VCHAR_TUNE.alphaCut;
         if (geomToo) vcharApplyGeom(o);
@@ -1233,9 +1287,13 @@ function updateVideoChars(t) {
             try { v.playbackRate = Math.max(0.10, Math.min(3.0, Math.max(box.rate, 0.20))); } catch (e) {}
             if (v.paused) { const p = v.play(); if (p && p.catch) p.catch(() => {}); }
         }
-        if (box.tex) {
-            if (!v.paused && v.readyState >= 2) box.tex.needsUpdate = true;
-            else if (box.fresh > 0) { box.fresh--; box.tex.needsUpdate = true; }
+        if (box.tex && box.drawCtx) {
+            if (!v.paused && v.readyState >= 2) {
+                try { box.drawCtx.drawImage(v, 0, 0, box.drawCv.width, box.drawCv.height); box.tex.needsUpdate = true; } catch (e) {}
+            } else if (box.fresh > 0) {
+                box.fresh--;
+                try { box.drawCtx.drawImage(v, 0, 0, box.drawCv.width, box.drawCv.height); box.tex.needsUpdate = true; } catch (e) {}
+            }
         }
     }
 }
@@ -1245,6 +1303,22 @@ animatedTrees.push({ uniforms: { uTime: { get value() { return 0; },
 
 /* ---------- ⑦ 调试 / 微调接口 ---------- */
 window.vcharTune = function (o) { Object.assign(VCHAR_TUNE, o || {}); vcharApplyAll(true); return VCHAR_TUNE; };
+/* 显示方式：vcharMode('alpha') 强制透明通道 / vcharMode('key') 强制蓝幕抠像 / vcharMode() 自动 */
+window.vcharMode = function (m) {
+    VCHAR_TUNE.mode = (m === 'key' || m === 'alpha') ? m : 'auto';
+    vcharApplyAll(false);
+    showSysToast('🎬 显示方式：' + (VCHAR_TUNE.mode === 'key' ? '强制蓝幕抠像'
+        : (VCHAR_TUNE.mode === 'alpha' ? '强制用透明通道' : '自动判断')));
+    return VCHAR_TUNE.mode;
+};
+/* 边缘发黑 → vcharFix(1)；边缘发白发灰 → vcharFix(0)；恢复自动 → vcharFix(-1) */
+window.vcharFix = function (v) {
+    VCHAR_TUNE.unpremul = (v === undefined) ? 1 : v;
+    vcharApplyAll(false);
+    showSysToast('🎬 预乘修正：' + (VCHAR_TUNE.unpremul < 0 ? '自动'
+        : (VCHAR_TUNE.unpremul ? '开' : '关')));
+    return VCHAR_TUNE.unpremul;
+};
 window.setVideoCharURL = function (u) {
     VCHAR_URL_FIX = u || '';
     VIDEO_CHARS.forEach(v => { delete v._vurl; delete v._vurlA; delete v._vurlF; });
