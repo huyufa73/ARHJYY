@@ -751,7 +751,7 @@ let currentAsset = ASSETS.path[0];
        vcharTune({ height:1.75 })            // 身高（米）
        vcharTune({ sim:0.26, smooth:0.20 })  // 抠像强度 / 边缘柔和度
        vcharTune({ spill:0.85 })             // 去蓝边（皮肤或头发发蓝就调大）
-       vcharTune({ idleRate:0.3 })           // 不说话时也轻微活动（0=定格）
+       vcharTune({ idleRate:0 })        // 不说话时也轻微活动（0=定格）
        vcharTune({ idleTime:0.4 })           // 定格在第几秒（挑一个闭嘴的帧）
        vcharTune({ crop:[0.12,0,0.88,1] })   // 裁掉画面左右空白 [左,下,右,上]
        vcharTune({ opacity:0.95 })           // 整体透明度
@@ -779,12 +779,223 @@ const VIDEO_CHARS = [
 ];
 VIDEO_CHARS.forEach(v => { if (!CLOUD_MODELS.some(m => m.id === v.id)) CLOUD_MODELS.push(v); });
 
+/* ==========================================================================
+   ★★★ 2026.10 新增：视频人物「自动发现」——以后放视频不用改一个字的代码 ★★★
+   把视频丢进仓库的 Videos 文件夹，云库「人物角色」+ 底部「景观摆放」自动多出这位人物。
+   · 支持 xxx.mp4（蓝幕/绿幕自动抠像）、xxx-alpha.webm（真透明）、xxx-alpha.mov（iOS透明）
+   · 同名多格式自动合并成同一位人物：webm ＞ mov ＞ mp4 依次降级
+   · 可以直接放 Videos/唐美人.mp4，也可以每人一个子文件夹 Videos/唐美人/唐美人.mp4
+   · 不想被当人物的视频：文件名或所在文件夹用下划线开头，例如 Videos/_bgm/x.mp4
+   · 控制台手动刷新：vcharRescan()      查看读到了谁：vcharDirList()
+   ========================================================================== */
+const VCHAR_REPO  = { user: 'huyufa73', repo: 'ARHJYY', dir: 'Videos' };
+/* 想给英文文件名配中文显示名 → 这里加一行即可（可选，不加也能用） */
+const VCHAR_ALIAS = { 'Gui Fu Ren': '贵夫人' };
+const VCHAR_VEXT  = /\.(webm|mov|mp4|m4v)$/i;
+const VCHAR_SCAN  = { done: false, busy: false, found: 0, ts: 0 };
+const VCHAR_LS    = 'arhj_vchar_dir_v2';
+
+function vcharKey(s) { return String(s || '').toLowerCase().replace(/[\s._\-]+/g, ''); }
+function vcharStem(path) {
+    const p = String(path || '');
+    const nm = p.slice(p.lastIndexOf('/') + 1);
+    return nm.replace(VCHAR_VEXT, '').replace(/[-_ ]?alpha$/i, '').trim();
+}
+function vcharSafeId(stem) {
+    let s = String(stem || '').replace(/[^0-9a-zA-Z\u4e00-\u9fa5]/g, '');
+    if (!s) {
+        let h = 0; const t = String(stem || 'v');
+        for (let i = 0; i < t.length; i++) h = (h * 31 + t.charCodeAt(i)) & 0xffff;
+        s = 'V' + h;
+    }
+    return 'vchar_' + s;
+}
+function vcharNiceName(stem) {
+    let n = String(stem || '');
+    Object.keys(VCHAR_ALIAS).forEach(k => { if (vcharKey(k) === vcharKey(n)) n = VCHAR_ALIAS[k]; });
+    return /视频/.test(n) ? n : (n + '·视频');
+}
+function vcharRefreshUI() {
+    try { renderAssetList(); } catch (e) {}
+    try { renderCloudModelList(); } catch (e) {}
+}
+/* ★ 云端语音此刻是否真的在响：句间小空隙给 600ms 宽限，避免嘴一顿一顿 */
+let _vcVoiceTs = 0;
+function vcharVoiceLive() {
+    try {
+        if (!useCloudTTS()) return true;                    /* 本地朗读：按 ttsSpeaking 判断 */
+        if (SFV.bufActive) _vcVoiceTs = Date.now();          /* 云端 Web Audio 正在出声 */
+        return (Date.now() - _vcVoiceTs) < 600;
+    } catch (e) { return true; }
+}
+async function vcharFetchJSON(url, ms) {
+    const ctl = new AbortController();
+    const to = setTimeout(() => { try { ctl.abort(); } catch (e) {} }, ms || 10000);
+    try {
+        const r = await fetch(url, { signal: ctl.signal, headers: { 'Accept': 'application/json' } });
+        clearTimeout(to);
+        if (!r.ok) return null;
+        return await r.json();
+    } catch (e) { clearTimeout(to); return null; }
+}
+async function vcharListRepo() {
+    const R = VCHAR_REPO, out = [];
+    const RX = new RegExp('^' + R.dir + '/', 'i');
+    const push = (p) => {
+        p = String(p || '').replace(/^\/+/, '');
+        if (!RX.test(p) || !VCHAR_VEXT.test(p)) return;
+        if (/(^|\/)[_~.]/.test(p.slice(R.dir.length))) return;   /* 下划线开头 = 不当人物 */
+        if (out.indexOf(p) < 0) out.push(p);
+    };
+    /* ① GitHub 文件树：一个请求拿到全仓库路径（最省、最快、推上去即时生效） */
+    const brs = ['main', 'master'];
+    for (let i = 0; i < brs.length; i++) {
+        const j = await vcharFetchJSON('https://api.github.com/repos/' + R.user + '/' + R.repo +
+            '/git/trees/' + brs[i] + '?recursive=1', 10000);
+        if (j && j.tree && j.tree.length) {
+            for (let k = 0; k < j.tree.length; k++) {
+                const t = j.tree[k];
+                if (t && t.type === 'blob') push(t.path);
+            }
+            if (out.length) return out;
+        }
+    }
+    /* ② GitHub 目录接口：只逐层读 Videos（文件树被截断时兜底） */
+    const walk = async (path, deep) => {
+        if (deep > 2) return;
+        const j = await vcharFetchJSON('https://api.github.com/repos/' + R.user + '/' + R.repo +
+            '/contents/' + encodeURI(path), 10000);
+        if (!j || !j.length) return;
+        for (let i = 0; i < j.length; i++) {
+            const it = j[i];
+            if (!it) continue;
+            if (it.type === 'file') push(it.path);
+            else if (it.type === 'dir') await walk(it.path, deep + 1);
+        }
+    };
+    await walk(R.dir, 0);
+    if (out.length) return out;
+    /* ③ jsDelivr 清单（限流时最后兜底；仓库超 50MB 它会拒绝，属正常） */
+    const jds = ['https://data.jsdelivr.com/v1/packages/gh/' + R.user + '/' + R.repo + '@main?structure=flat',
+                 'https://data.jsdelivr.com/v1/package/gh/' + R.user + '/' + R.repo + '@main/flat'];
+    for (let i = 0; i < jds.length; i++) {
+        const j = await vcharFetchJSON(jds[i], 10000);
+        const fs = (j && j.files) || [];
+        for (let k = 0; k < fs.length; k++) push((fs[k] && (fs[k].name || fs[k].path)) || '');
+        if (out.length) return out;
+    }
+    return out;
+}
+/* 登记一位视频人物（已存在就只更新路径，手写条目的名字绝不覆盖） */
+function vcharAdopt(g) {
+    if (!g || !g.id) return false;
+    let a = CLOUD_MODELS.find(x => x.id === g.id);
+    const isNew = !a;
+    if (isNew) {
+        a = { id: g.id, cat: 'cat_renwu', name: g.name || g.id, icon: '🎬',
+              isVideo: true, realHeight: 1.68, _auto: 1 };
+        CLOUD_MODELS.push(a);
+        VIDEO_CHARS.push(a);
+        let at = 0;
+        for (let i = 0; i < ASSETS.object.length; i++)
+            if (String(ASSETS.object[i].id).indexOf('vchar_') === 0) at = i + 1;
+        if (!ASSETS.object.some(x => x.id === a.id))
+            ASSETS.object.splice(at, 0, { id: a.id, name: a.name, icon: '🎬' });
+    }
+    a.isVideo = true; a.cat = 'cat_renwu';
+    let chg = isNew;
+    if (g.webm && a.file !== g.webm)     { a.file = g.webm;     chg = 1; }
+    if (g.mov  && a.alt !== g.mov)       { a.alt = g.mov;       chg = 1; }
+    if (g.mp4  && a.fallback !== g.mp4)  { a.fallback = g.mp4;  chg = 1; }
+    if (chg) { delete a._urls; delete a._vurl; delete a._vurlA; delete a._vurlF; }
+    return isNew;
+}
+function vcharSaveCache(list) {
+    try {
+        localStorage.setItem(VCHAR_LS, JSON.stringify({ t: Date.now(), groups: list.map(g => ({
+            id: g.id, name: g.name, webm: g.webm || '', mov: g.mov || '', mp4: g.mp4 || ''
+        })) }));
+    } catch (e) {}
+}
+function vcharLoadCache() {
+    let n = 0;
+    try {
+        const j = JSON.parse(localStorage.getItem(VCHAR_LS) || 'null');
+        if (j && j.groups) j.groups.forEach(g => { if (g && g.id && vcharAdopt(g)) n++; });
+    } catch (e) {}
+    return n;
+}
+async function vcharScan(silent) {
+    if (VCHAR_SCAN.busy) return VCHAR_SCAN.found;
+    VCHAR_SCAN.busy = true;
+    let add = 0;
+    if (!VCHAR_SCAN.done) add += vcharLoadCache();      /* 先用本机缓存立刻上架，断网也能用 */
+    if (add) vcharRefreshUI();
+    try {
+        const files = await vcharListRepo();
+        if (files && files.length) {
+            const grp = {};
+            files.forEach(p => {
+                const stem = vcharStem(p);
+                if (!stem) return;
+                const k = vcharKey(stem);
+                if (!grp[k]) grp[k] = { stem: stem };
+                const g = grp[k];
+                if (/\.webm$/i.test(p))      { if (!g.webm) g.webm = p; }
+                else if (/\.mov$/i.test(p))  { if (!g.mov)  g.mov  = p; }
+                else if (!g.mp4)             { g.mp4 = p; }
+            });
+            const list = [], alive = {};
+            Object.keys(grp).forEach(k => {
+                const g = grp[k];
+                if (!g.webm && !g.mov && !g.mp4) return;
+                g.id = vcharSafeId(g.stem);
+                g.name = vcharNiceName(g.stem);
+                alive[g.id] = 1;
+                list.push(g);
+                if (vcharAdopt(g)) add++;
+            });
+            /* 仓库里已删掉的自动人物同步下架（手写的贵夫人永不受影响） */
+            for (let i = CLOUD_MODELS.length - 1; i >= 0; i--) {
+                const a = CLOUD_MODELS[i];
+                if (!a || !a._auto || alive[a.id]) continue;
+                CLOUD_MODELS.splice(i, 1);
+                for (let j = VIDEO_CHARS.length - 1; j >= 0; j--)
+                    if (VIDEO_CHARS[j].id === a.id) VIDEO_CHARS.splice(j, 1);
+                for (let j = ASSETS.object.length - 1; j >= 0; j--)
+                    if (ASSETS.object[j].id === a.id) ASSETS.object.splice(j, 1);
+                add++;
+            }
+            vcharSaveCache(list);
+            VCHAR_SCAN.done = true;
+            VCHAR_SCAN.found = list.length;
+            VCHAR_SCAN.ts = Date.now();
+        }
+    } catch (e) {}
+    if (add) vcharRefreshUI();
+    if (!silent)
+        showSysToast(VCHAR_SCAN.found
+            ? ('🎬 Videos 里共 ' + VCHAR_SCAN.found + ' 位视频人物' + (add ? '（已更新）' : ''))
+            : '⚠ 没读到 Videos 文件夹，请检查网络');
+    else if (add) showSysToast('🎬 云库已自动更新视频人物');
+    VCHAR_SCAN.busy = false;
+    return VCHAR_SCAN.found;
+}
+window.vcharRescan = function () { VCHAR_SCAN.done = false; VCHAR_SCAN.ts = 0; return vcharScan(false); };
+window.vcharDirList = function () {
+    const s = CLOUD_MODELS.filter(m => m.isVideo)
+        .map(m => (m._auto ? '（自动）' : '（内置）') + m.name + ' → ' + (m.file || m.alt || m.fallback || '?'))
+        .join('\n');
+    console.log(s); showSysToast(s.slice(0, 95) || '暂无视频人物'); return s;
+};
+/* ===================== 视频人物·自动发现 结束 ===================== */
+
 /* unpremul : 若人物边缘发黑/发灰 → vcharTune({unpremul:1})
    edge     : 收边（去半透明毛边），0.02~0.14 之间调
    alphaCut : 低于这个透明度直接丢弃像素，越大越干净但边缘越硬 */
-const VCHAR_TUNE = { height: 1.68, sim: 0.30, smooth: 0.18, spill: 0.78, opacity: 1.0,
-                     idleRate: 0.22, idleTime: 0.60, crop: null, key: null, yawFix: 0,
-                     unpremul: -1, edge: 0.04, alphaCut: 0.04, mode: 'key' };
+const VCHAR_TUNE = { height: 1.68, sim: 0.22, smooth: 0.12, spill: 0.70, opacity: 1.0,
+                     idleRate: 0, idleTime: 0.60,   /* ★ 0 = 不说话时视频完全定格（不动嘴），说话才播；想待机也轻微活动就填 0.25 */ crop: null, key: null, yawFix: 0,
+                     unpremul: -1, edge: 0.03, alphaCut: 0.03, mode: 'key' };
 const VCHAR_CACHE = {};
 let VCHAR_LIST = [];
 let VCHAR_URL_FIX = '';
@@ -946,10 +1157,11 @@ function vcharMat(box) {
                     c = mix(c, cs, uUnpre);
                     a = clamp((a - uEdge) / max(0.0001, 1.0 - uEdge), 0.0, 1.0);  /* 收掉毛边 */
                 } else {
-                    /* 兜底：蓝幕/绿幕自动抠像（原逻辑，一字未改） */
+                    /* 兜底：蓝幕/绿幕自动抠像（★人物内部一律拉满不透光，只留边缘柔和） */
                     vec3 cn = c / max(0.02, max(c.r, max(c.g, c.b)));
                     float d = distance(cbcr(cn), uKeyCC);
                     a = smoothstep(uSim, uSim + max(uSmooth, 0.002), d);
+                    a = clamp((a - 0.12) / 0.55, 0.0, 1.0);
                     if (uKey.b >= uKey.g) {
                         float sp = max(0.0, c.b - max(c.r, c.g));
                         c.b -= sp * uSpill;
@@ -958,7 +1170,7 @@ function vcharMat(box) {
                         float sp = max(0.0, c.g - max(c.r, c.b));
                         c.g -= sp * uSpill;
                     }
-                    c *= mix(0.88, 1.0, a);
+                    c *= mix(0.95, 1.0, a);
                     a *= t.a;
                 }
                 float al = a * uOpacity;
@@ -1052,7 +1264,12 @@ function vcharGet(id, cb) {
     if (c && c.ready) { cb(c); return; }
     if (c && c.waits) { c.waits.push(cb); return; }
     const asset = CLOUD_MODELS.find(a => a.id === id);
-    if (!asset) return;
+    if (!asset) {
+        /* ★ 读档/换机时可能遇到"新丢进 Videos 的人物"：先扫一遍目录再自动重试一次 */
+        if (!VCHAR_SCAN.done && !VCHAR_SCAN.busy)
+            vcharScan(true).then(() => { if (CLOUD_MODELS.some(a => a.id === id)) vcharGet(id, cb); });
+        return;
+    }
     const box = { waits: [cb], ready: false, rate: 0, fresh: 0, hasAlpha: true };
     VCHAR_CACHE[id] = box;
     const toast = document.getElementById('loading-toast');
@@ -1263,6 +1480,8 @@ function updateVideoChars(t) {
         let rate = VCHAR_TUNE.idleRate || 0;
         let talking = false;
         try { talking = (chatTarget === o) && (ttsSpeaking || TALK.on); } catch (e) {}
+        /* ★ 只有"声音真的在响"才算正在说话：合成/缓冲的空档定格不动嘴 */
+        if (talking) { try { if (!vcharVoiceLive()) talking = false; } catch (e) {} }
         if (talking) {
             let lv = 0;
             try { lv = (SFV && SFV.level) ? SFV.level : 0; } catch (e) {}
@@ -1274,16 +1493,24 @@ function updateVideoChars(t) {
     for (const k in need) {
         const box = VCHAR_CACHE[k];
         if (!box || !box.ready || !box.video) continue;
-        const v = box.video, want = need[k];
+        const v = box.video;
+        let want = need[k];
+        /* ★ 刚载入的 1.8 秒先正常播一下：让「透明通道探测 / 幕布自动取色」拿到有效画面，
+           探测完再定格 —— 否则可能停在一张黑帧上取不到色，抠像会发蓝 */
+        if (box.warmTs == null) box.warmTs = Date.now() + 1800;
+        if (Date.now() < box.warmTs) want = Math.max(want, 0.60);
         box.rate = (box.rate == null) ? want : (box.rate + (want - box.rate) * 0.30);
         if (want <= 0.02) {
             if (!v.paused) {
                 try { v.pause(); } catch (e) {}
                 if (VCHAR_TUNE.idleTime != null) { try { v.currentTime = VCHAR_TUNE.idleTime; } catch (e) {} }
-                box.fresh = 10;
+                box.fresh = 26; box.still = 0;   /* ★ 约0.4秒内持续把定格帧贴上去，等 seek 到闭嘴帧完成 */
             }
             box.rate = 0;
+            /* ★ seek 慢的机型再补几帧，之后彻底静止（零开销） */
+            if (!box.still && box.fresh <= 0) { box.still = 1; box.fresh = 4; }
         } else {
+            box.still = 0;
             try { v.playbackRate = Math.max(0.10, Math.min(3.0, Math.max(box.rate, 0.20))); } catch (e) {}
             if (v.paused) { const p = v.play(); if (p && p.catch) p.catch(() => {}); }
         }
@@ -1361,6 +1588,391 @@ window.vcharDiag = async function () {
 };
 /* ===================== 视频人物模块 结束 ===================== */
 
+/* ==========================================================================
+   ★★★ 2026 新增：古筝音乐模块（自动发现 music/ 下的 mp3，古筝女可弹奏）★★★
+   · 把 mp3 丢进仓库 music 文件夹即可，之后增减歌曲都不用改代码，自动识别
+   · 放置「古筝女」→ 轻点她语音通话 → 说“请弹古筝” → 她报曲目问你听哪首
+   · 你报曲名（或“第2首”）她就弹，循环播放，直到你说“停/别弹了”
+   · 她说话时自动停手不弹奏、并把琴声压低；说完继续随乐律动，像真人一样
+   控制台可手动：musicRescan() 重新扫描   musicWhat() 查看曲目
+   ========================================================================== */
+const MUSIC_REPO  = { user: 'huyufa73', repo: 'ARHJYY', dir: 'music' };
+const MUSIC_BASES = [
+    'https://huyufa73.github.io/ARHJYY/',
+    'https://cdn.jsdelivr.net/gh/huyufa73/ARHJYY@main/',
+    'https://fastly.jsdelivr.net/gh/huyufa73/ARHJYY@main/',
+    'https://gcore.jsdelivr.net/gh/huyufa73/ARHJYY@main/',
+    'https://media.githubusercontent.com/media/huyufa73/ARHJYY/main/',
+    'https://raw.githubusercontent.com/huyufa73/ARHJYY/main/'
+];
+const MUSIC_EXT = /\.(mp3|m4a|aac|wav|ogg)$/i;
+const MUSIC = { list: [], scanned: false, busy: false, ts: 0, audio: null, playing: null };
+
+function musicTitle(path) {
+    const p = String(path || '');
+    const nm = p.slice(p.lastIndexOf('/') + 1);
+    return nm.replace(MUSIC_EXT, '').replace(/[_]+/g, ' ').trim();
+}
+async function musicListRepo() {
+    const R = MUSIC_REPO, out = [];
+    const RX = new RegExp('^' + R.dir + '/', 'i');
+    const push = (p) => {
+        p = String(p || '').replace(/^\/+/, '');
+        if (!RX.test(p) || !MUSIC_EXT.test(p)) return;
+        if (/(^|\/)[_~.]/.test(p.slice(R.dir.length))) return;
+        if (out.indexOf(p) < 0) out.push(p);
+    };
+    const brs = ['main', 'master'];
+    for (let i = 0; i < brs.length; i++) {
+        const j = await vcharFetchJSON('https://api.github.com/repos/' + R.user + '/' + R.repo +
+            '/git/trees/' + brs[i] + '?recursive=1', 10000);
+        if (j && j.tree && j.tree.length) {
+            for (let k = 0; k < j.tree.length; k++) { const t = j.tree[k]; if (t && t.type === 'blob') push(t.path); }
+            if (out.length) return out;
+        }
+    }
+    const walk = async (path, deep) => {
+        if (deep > 2) return;
+        const j = await vcharFetchJSON('https://api.github.com/repos/' + R.user + '/' + R.repo +
+            '/contents/' + encodeURI(path), 10000);
+        if (!j || !j.length) return;
+        for (let i = 0; i < j.length; i++) {
+            const it = j[i]; if (!it) continue;
+            if (it.type === 'file') push(it.path);
+            else if (it.type === 'dir') await walk(it.path, deep + 1);
+        }
+    };
+    await walk(R.dir, 0);
+    if (out.length) return out;
+    const jds = ['https://data.jsdelivr.com/v1/packages/gh/' + R.user + '/' + R.repo + '@main?structure=flat',
+                 'https://data.jsdelivr.com/v1/package/gh/' + R.user + '/' + R.repo + '@main/flat'];
+    for (let i = 0; i < jds.length; i++) {
+        const j = await vcharFetchJSON(jds[i], 10000);
+        const fs = (j && j.files) || [];
+        for (let k = 0; k < fs.length; k++) push((fs[k] && (fs[k].name || fs[k].path)) || '');
+        if (out.length) return out;
+    }
+    return out;
+}
+async function musicScan(silent) {
+    if (MUSIC.busy) return MUSIC.list.length;
+    MUSIC.busy = true;
+    try {
+        const files = await musicListRepo();
+        if (files && files.length) {
+            const old = {}; MUSIC.list.forEach(it => { old[it.file] = it._url; });
+            MUSIC.list = files.map(f => ({ file: f, title: musicTitle(f), _url: old[f] || '' }));
+            MUSIC.scanned = true; MUSIC.ts = Date.now();
+        }
+    } catch (e) {}
+    MUSIC.busy = false;
+    if (!silent) showSysToast(MUSIC.list.length ? ('🎵 曲库共 ' + MUSIC.list.length + ' 首') : '⚠ 没读到 music 文件夹，请检查网络');
+    return MUSIC.list.length;
+}
+async function musicFindURL(item) {
+    if (item._url) return item._url;
+    for (let b = 0; b < MUSIC_BASES.length; b++) {
+        const u = MUSIC_BASES[b] + encodeURI(item.file);
+        const hit = await vcharProbe([u], 1);
+        if (hit) { item._url = hit; return hit; }
+    }
+    return '';
+}
+function musicAudio() {
+    if (!MUSIC.audio) {
+        const el = document.createElement('audio');
+        el.loop = true; el.preload = 'auto';
+        el.setAttribute('playsinline', ''); el.setAttribute('webkit-playsinline', '');
+        el.style.cssText = 'position:fixed;left:0;bottom:0;width:1px;height:1px;opacity:0.01;pointer-events:none;z-index:-1;';
+        document.body.appendChild(el);
+        MUSIC.audio = el;
+    }
+    return MUSIC.audio;
+}
+function musicUnlock() {   /* 在点击手势里先解锁音频，手机才允许之后由语音触发播放 */
+    const el = musicAudio();
+    try {
+        el.muted = true; el.src = SF_SILENT;
+        const p = el.play(); if (p && p.catch) p.catch(() => {});
+        setTimeout(() => { try { el.pause(); el.muted = false; } catch (e) {} }, 60);
+    } catch (e) {}
+}
+async function musicPlay(item) {
+    if (!item) return false;
+    const el = musicAudio();
+    let url = item._url;
+    if (!url) { vcStatus('○ 取曲中…'); url = await musicFindURL(item); }
+    if (!url) return false;
+    try { el.src = url; el.loop = true; el.currentTime = 0; el.volume = 1.0; const p = el.play(); if (p && p.catch) p.catch(() => {}); }
+    catch (e) { return false; }
+    MUSIC.playing = item;
+    return true;
+}
+function musicStop() {
+    if (MUSIC.audio) { try { MUSIC.audio.pause(); } catch (e) {} }
+    MUSIC.playing = null;
+}
+function musicNext() {
+    if (!MUSIC.list.length) return null;
+    const i = MUSIC.playing ? MUSIC.list.indexOf(MUSIC.playing) : -1;
+    return MUSIC.list[(i + 1 + MUSIC.list.length) % MUSIC.list.length];
+}
+function musicMatch(text) {
+    const s = String(text).replace(/[《》\s、,，。.!！?？~—\-]/g, '').toLowerCase();
+    if (!s) return null;
+    let best = null, bl = 1;
+    MUSIC.list.forEach(it => {
+        const t = it.title.replace(/[《》\s]/g, '').toLowerCase();
+        if (t.length >= 2 && s.indexOf(t) >= 0 && t.length > bl) { best = it; bl = t.length; }
+    });
+    return best;
+}
+function musicCnNum(s) {
+    s = String(s).trim();
+    if (/^[0-9]+$/.test(s)) return parseInt(s, 10);
+    const map = { 零:0, 一:1, 二:2, 两:2, 三:3, 四:4, 五:5, 六:6, 七:7, 八:8, 九:9, 十:10 };
+    if (s === '十') return 10;
+    if (s.length === 1) return map[s] || 0;
+    if (s.indexOf('十') >= 0) {
+        const p = s.split('十');
+        const a = p[0] ? (map[p[0]] || 0) : 1;
+        const b = p[1] ? (map[p[1]] || 0) : 0;
+        return a * 10 + b;
+    }
+    return map[s] || 0;
+}
+function musicListText() {
+    if (!MUSIC.list.length) return '';
+    return MUSIC.list.map((it, i) => '第' + (i + 1) + '首《' + it.title + '》').join('、');
+}
+function isGuzhengChar(obj) {
+    if (!obj || !obj.userData) return false;
+    const id = obj.userData.id || obj.userData.modelId;
+    if (id === 'cloud_GuZhengNv') return true;
+    return /古筝/.test(characterName(obj));
+}
+function guzhengSpeak(line, emo) {
+    ttsBegin();
+    SF_EMO_NOW = (emo && SF_EMO[emo]) ? emo : '古风';
+    if (chatTarget && chatTarget.userData && chatTarget.userData._chatLog)
+        chatTarget.userData._chatLog.push({ role: 'assistant', content: line });
+    ttsPush(line, true);
+}
+const RX_MUSIC_STOP = /(停|别弹|别奏|不弹|不听|停下|停止|歇一?会|安静|够了|结束|收(工|了)|不要弹|停一)/;
+const RX_MUSIC_PLAY = /((弹|奏|抚|演奏|来|听|放|唱|想听)[^。！？!?]{0,5}(古筝|筝|琴|曲|音乐|歌|一曲|小曲))|弹古筝|弹奏|抚琴|来一?曲|来一?首|演奏|再弹|再来一?(首|曲)|换一?(首|曲)|下一?(首|曲)/;
+async function handleGuzhengCommand(text) {
+    if (!chatTarget || !isGuzhengChar(chatTarget)) return false;
+    const t = String(text || '');
+    /* ① 停止弹奏 */
+    if (MUSIC.playing && RX_MUSIC_STOP.test(t)) {
+        musicStop();
+        guzhengSpeak('好，妾身便停了。公子若还想听，随时唤妾身抚筝。', '温柔');
+        vcStatus('■ 已停止弹奏');
+        return true;
+    }
+    const playWord = RX_MUSIC_PLAY.test(t);
+    const numHit = /第?\s*[0-9一二三四五六七八九十两]{1,3}\s*(首|曲)/.test(t);
+    if (playWord || numHit) {
+        if (!MUSIC.scanned || !MUSIC.list.length) { vcStatus('○ 妾身翻看曲谱…'); await musicScan(true); }
+    } else {
+        if (!MUSIC.list.length) return false;   // 普通聊天，绝不误触
+    }
+    /* ② 指定曲名 */
+    let item = musicMatch(t);
+    /* ③ 序号选曲（第2首 / 第二首） */
+    if (!item && numHit) {
+        const m = t.match(/第?\s*([0-9一二三四五六七八九十两]{1,3})\s*(首|曲)/);
+        if (m) { const n = musicCnNum(m[1]); if (n >= 1 && n <= MUSIC.list.length) item = MUSIC.list[n - 1]; }
+    }
+    /* ④ 换一首 / 下一首 / 再来一首 */
+    if (!item && playWord && /(换|下一|再来|再弹)/.test(t) && MUSIC.list.length) item = musicNext();
+    if (item) {
+        vcStatus('🎵 备曲中…');
+        const ok = await musicPlay(item);
+        if (ok) { guzhengSpeak('好，妾身便为公子弹奏一曲《' + item.title + '》。', '古风'); vcStatus('🎶 正在弹奏《' + item.title + '》'); }
+        else guzhengSpeak('这首《' + item.title + '》一时取不出来，公子换一首可好？', '难过');
+        return true;
+    }
+    /* ⑤ 泛请求 → 报曲目、问听哪首 */
+    if (playWord) {
+        if (!MUSIC.list.length) { guzhengSpeak('公子恕罪，妾身的曲谱尚未备好，稍候再来听妾身抚筝可好？', '难过'); return true; }
+        guzhengSpeak('公子想听哪一首呢？妾身这里有：' + musicListText() + '。公子报个曲名，妾身即刻抚筝。', '温柔');
+        return true;
+    }
+    return false;   // 不是弹琴相关 → 交给 AI 正常对话
+}
+/* 她说话时压低琴声、说完自动回满（借用每帧遍历，loop 一行不改） */
+function updateMusicDuck() {
+    if (!MUSIC.audio || !MUSIC.playing) return;
+    const target = ttsSpeaking ? 0.30 : 1.0;
+    MUSIC.audio.volume += (target - MUSIC.audio.volume) * 0.08;
+}
+animatedTrees.push({ uniforms: { uTime: { get value() { return 0; }, set value(t) { try { updateMusicDuck(t); } catch (e) {} } } } });
+window.musicRescan = function () { MUSIC.scanned = false; MUSIC.ts = 0; return musicScan(false); };
+window.musicWhat = function () { const s = MUSIC.list.map((it, i) => (i + 1) + '.' + it.title).join('  '); console.log(s); showSysToast(s.slice(0, 95) || '暂无曲目'); return s; };
+/* ===================== 古筝音乐模块 结束 ===================== */
+/* ==========================================================================
+   ★★★ 2026 新增：模型 / 材质「自动发现」——以后往仓库丢 GLB、贴图都不用改代码 ★★★
+   · 模型丢进 MoXingKu 的对应子文件夹（ZhiWu_HuaHui花草/树木、JiaShan_ShiTou假山石、
+     JianZhu_JingGuan建筑、RenWu_JiaoSe人物），云库对应分类自动出现
+   · 铺装贴图丢进 Texture Map/PavingStone/（jpg/png），底部「路径绘制」素材栏自动多出该材质
+   · 已内置的模型/材质会自动跳过，绝不重复；文件名以下划线开头的会被忽略
+   · 控制台可手动刷新：modelRescan()   texRescan()
+   ========================================================================== */
+const AUTO_REPO = { user: 'huyufa73', repo: 'ARHJYY' };
+let _ghTreeCache = null, _ghTreeTs = 0;
+async function ghFullTree() {
+    if (_ghTreeCache && Date.now() - _ghTreeTs < 300000) return _ghTreeCache;
+    const brs = ['main', 'master'];
+    for (let i = 0; i < brs.length; i++) {
+        const j = await vcharFetchJSON('https://api.github.com/repos/' + AUTO_REPO.user + '/' + AUTO_REPO.repo +
+            '/git/trees/' + brs[i] + '?recursive=1', 12000);
+        if (j && j.tree && j.tree.length) {
+            const arr = [];
+            for (let k = 0; k < j.tree.length; k++) { const t = j.tree[k]; if (t && t.type === 'blob') arr.push(t.path); }
+            if (arr.length) { _ghTreeCache = arr; _ghTreeTs = Date.now(); return arr; }
+        }
+    }
+    const jds = ['https://data.jsdelivr.com/v1/packages/gh/' + AUTO_REPO.user + '/' + AUTO_REPO.repo + '@main?structure=flat',
+                 'https://data.jsdelivr.com/v1/package/gh/' + AUTO_REPO.user + '/' + AUTO_REPO.repo + '@main/flat'];
+    for (let i = 0; i < jds.length; i++) {
+        const j = await vcharFetchJSON(jds[i], 12000);
+        const fs = (j && j.files) || [];
+        const arr = [];
+        for (let k = 0; k < fs.length; k++) { const nm = (fs[k] && (fs[k].name || fs[k].path)) || ''; if (nm) arr.push(String(nm).replace(/^\/+/, '')); }
+        if (arr.length) { _ghTreeCache = arr; _ghTreeTs = Date.now(); return arr; }
+    }
+    return _ghTreeCache || [];
+}
+async function ghWalkDir(dir, extRe) {
+    const out = [];
+    const RX = new RegExp('^' + dir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '/', 'i');
+    const push = (p) => { p = String(p || '').replace(/^\/+/, ''); if (!RX.test(p) || !extRe.test(p)) return; if (/(^|\/)[_~.]/.test(p.slice(dir.length))) return; if (out.indexOf(p) < 0) out.push(p); };
+    const walk = async (path, deep) => {
+        if (deep > 3) return;
+        const j = await vcharFetchJSON('https://api.github.com/repos/' + AUTO_REPO.user + '/' + AUTO_REPO.repo +
+            '/contents/' + encodeURI(path), 12000);
+        if (!j || !j.length) return;
+        for (let i = 0; i < j.length; i++) { const it = j[i]; if (!it) continue; if (it.type === 'file') push(it.path); else if (it.type === 'dir') await walk(it.path, deep + 1); }
+    };
+    await walk(dir, 0);
+    return out;
+}
+function ghFilter(paths, dir, extRe) {
+    const RX = new RegExp('^' + dir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '/', 'i');
+    const out = [];
+    paths.forEach(p => { p = String(p || ''); if (!RX.test(p) || !extRe.test(p)) return; if (/(^|\/)[_~.]/.test(p.slice(dir.length))) return; if (out.indexOf(p) < 0) out.push(p); });
+    return out;
+}
+async function scanDirFiles(dir, extRe) {
+    let files = ghFilter(await ghFullTree(), dir, extRe);
+    if (!files.length) files = await ghWalkDir(dir, extRe);
+    return files;
+}
+
+/* ---------- 模型自动发现（MoXingKu/*.glb） ---------- */
+const MODEL_EXT = /\.glb$/i;
+const MODEL_DIR_CAT = {
+    'jiashan_shitou': 'cat_jiashan', 'jianzhu_jingguan': 'cat_jianzhu',
+    'renwu_jiaose': 'cat_renwu', 'zhiwu_huahui': 'cat_zhiwu'
+};
+const MODEL_ICON  = { cat_renwu: '🧑', cat_jianzhu: '🏯', cat_jiashan: '🪨', cat_shumu: '🌳', cat_zhiwu: '🌸' };
+const MODEL_REALH = { cat_renwu: 1.65, cat_jianzhu: 3.5, cat_jiashan: 0.8, cat_shumu: 3.5, cat_zhiwu: 0.6 };
+const MODEL_ALIAS = {};   /* 想给拼音文件名配中文显示名 → 这里加一行，例如 'LiuShu':'柳树'（可选，不加也能用） */
+const MODELSCAN = { done: false, busy: false, ts: 0, found: 0 };
+
+function modelStem(p) { const nm = String(p).slice(String(p).lastIndexOf('/') + 1); return nm.replace(MODEL_EXT, '').trim(); }
+function modelSafeId(stem) {
+    let s = String(stem || '').replace(/[^0-9a-zA-Z\u4e00-\u9fa5]/g, '');
+    if (!s) { let h = 0; const t = String(stem || 'm'); for (let i = 0; i < t.length; i++) h = (h * 31 + t.charCodeAt(i)) & 0xffff; s = 'M' + h; }
+    return 'cloud_' + s;
+}
+function modelKey(file) {
+    const rel = String(file || '').replace(/^MoXingKu\//i, '');
+    const slash = rel.lastIndexOf('/');
+    const dir = slash >= 0 ? rel.slice(0, slash) : '';
+    return (dir + '/' + modelStem(rel)).toLowerCase().replace(/[\s_\-]/g, '');
+}
+function modelCatOf(dir, stem) {
+    let cat = MODEL_DIR_CAT[String(dir || '').toLowerCase()] || 'cat_zhiwu';
+    if (cat === 'cat_zhiwu' && /(shu|song|zhu|mu)$/i.test(stem)) cat = 'cat_shumu';
+    return cat;
+}
+async function modelScan(silent) {
+    if (MODELSCAN.busy) return MODELSCAN.found;
+    MODELSCAN.busy = true;
+    let add = 0;
+    try {
+        const files = await scanDirFiles('MoXingKu', MODEL_EXT);
+        if (files && files.length) {
+            const have = {};
+            CLOUD_MODELS.forEach(m => { if (m.file) have[modelKey(m.file)] = 1; });
+            files.forEach(f => {
+                const key = modelKey(f);
+                if (have[key]) return;
+                have[key] = 1;
+                const rel = f.replace(/^MoXingKu\//i, '');
+                const slash = rel.indexOf('/');
+                const dir = slash >= 0 ? rel.slice(0, slash) : '';
+                const stem = modelStem(rel);
+                const cat = modelCatOf(dir, stem);
+                let id = modelSafeId(stem);
+                if (CLOUD_MODELS.some(x => x.id === id)) id = id + '_' + ((Math.random() * 9000 + 1000) | 0);
+                const m = {
+                    id: id, cat: cat, name: (MODEL_ALIAS[stem] || stem), icon: MODEL_ICON[cat] || '🧩',
+                    file: rel, isCloud: true, canMultiRot: true, realHeight: MODEL_REALH[cat] || 1.0, _autoModel: 1
+                };
+                if (cat === 'cat_zhiwu' || cat === 'cat_shumu') m.isPlant = true;
+                CLOUD_MODELS.push(m);
+                add++;
+            });
+            MODELSCAN.done = true; MODELSCAN.ts = Date.now();
+            MODELSCAN.found = CLOUD_MODELS.filter(m => m.file).length;
+        }
+    } catch (e) {}
+    MODELSCAN.busy = false;
+    if (add) { try { renderCloudCategoryBar(); } catch (e) {} try { renderCloudModelList(); } catch (e) {} }
+    if (!silent) showSysToast(MODELSCAN.found ? ('🧩 模型库共 ' + MODELSCAN.found + ' 个' + (add ? '（新增 ' + add + '）' : '')) : '⚠ 没读到模型库，请检查网络');
+    else if (add) showSysToast('🧩 云库已自动发现 ' + add + ' 个新模型');
+    return MODELSCAN.found;
+}
+window.modelRescan = function () { MODELSCAN.done = false; MODELSCAN.ts = 0; _ghTreeCache = null; return modelScan(false); };
+
+/* ---------- 铺装材质自动发现（Texture Map/PavingStone/*.jpg …） ---------- */
+const TEX_EXT = /\.(jpg|jpeg|png|webp)$/i;
+const TEXSCAN = { done: false, busy: false, ts: 0, found: 0 };
+async function texScan(silent) {
+    if (TEXSCAN.busy) return TEXSCAN.found;
+    TEXSCAN.busy = true;
+    let add = 0;
+    try {
+        const files = await scanDirFiles('Texture Map', TEX_EXT);
+        if (files && files.length) {
+            const have = {};
+            Object.keys(PAVE_TEX).forEach(k => { have[PAVE_TEX[k]] = 1; });
+            ASSETS.path.forEach(a => { if (a.extTex) have[a.extTex] = 1; });
+            files.forEach(f => {
+                if (!/\/PavingStone\//i.test(f)) return;   // 只把 PavingStone 里的图做成铺装材质
+                const rel = f.replace(/^Texture Map\//i, '');
+                const url = TEX_BASE + rel.split('/').map(encodeURIComponent).join('/');
+                if (have[url]) return;
+                have[url] = 1;
+                const stem = f.slice(f.lastIndexOf('/') + 1).replace(TEX_EXT, '');
+                ASSETS.path.push({ id: 'pave_auto_' + modelSafeId(stem).slice(6), name: stem, icon: '🧱', extTex: url, rep: 2, _autoTex: 1 });
+                add++;
+            });
+            TEXSCAN.found = ASSETS.path.filter(a => a.extTex).length;
+            TEXSCAN.done = true; TEXSCAN.ts = Date.now();
+        }
+    } catch (e) {}
+    TEXSCAN.busy = false;
+    if (add && currentMode === 'path') { try { renderAssetList(); } catch (e) {} }
+    if (!silent) showSysToast(add ? ('🧱 新增 ' + add + ' 款铺装材质') : '铺装材质已是最新');
+    else if (add) showSysToast('🧱 已自动发现 ' + add + ' 款新铺装');
+    return add;
+}
+window.texRescan = function () { TEXSCAN.done = false; _ghTreeCache = null; return texScan(false); };
+/* ===================== 模型 / 材质 自动发现 结束 ===================== */
 const dracoLoader = new DRACOLoader();
 /* ★ 与 importmap 统一走 jsdelivr：unpkg 国内易超时，会让 Draco 压缩模型加载失败 */
 dracoLoader.setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/libs/draco/');
@@ -3228,6 +3840,14 @@ function startApp() {
     renderAssetList();
     renderCloudCategoryBar();
     renderScatterList();
+    /* ★ 开机后台自动扫描 Videos/：以后往里丢视频，云库自动出现，无需改代码 */
+    setTimeout(() => { try { vcharScan(true); } catch (e) {} }, 1200);
+    /* ★ 开机后台自动扫描 music/：以后往里丢 mp3，古筝女自动识别，无需改代码 */
+    setTimeout(() => { try { musicScan(true); } catch (e) {} }, 1600);
+    /* ★ 开机后台自动扫描 MoXingKu/：以后往里丢 GLB 模型，云库自动出现，无需改代码 */
+    setTimeout(() => { try { modelScan(true); } catch (e) {} }, 2000);
+    /* ★ 开机后台自动扫描 Texture Map/：以后往里丢铺装贴图，素材栏自动出现，无需改代码 */
+    setTimeout(() => { try { texScan(true); } catch (e) {} }, 2500);
     for(let i=0; i<6; i++) butterflies.push(new Butterfly(i));
     setTimeout(() => { const h = document.getElementById('hint'); if (h) { h.style.transition = 'opacity 1s'; h.style.opacity = '0'; } }, 6000);
     renderer.setAnimationLoop(loop);
@@ -5300,6 +5920,8 @@ function setupInteractions() {
         document.getElementById('cloud-drawer').classList.add('open');
         // 不再强制切成"景观摆放"：路径模式下打开云库，就是要沿路径按间距排布
         renderCloudCategoryBar();
+        /* ★ 打开云库顺手扫一次模型库：刚丢进 MoXingKu 的新模型立刻出现 */
+        if (!MODELSCAN.done || Date.now() - (MODELSCAN.ts || 0) > 120000) { try { modelScan(true); } catch (e) {} }
         showSysToast(currentMode === 'path'
             ? '路径模式：选模型 → 按住画线 → 生成幻景'
             : '景观模式：选模型 → 点地面放置');
@@ -5386,6 +6008,7 @@ function setupInteractions() {
             eyeBtn.title = '隐藏界面录屏';
             eyeBtn.classList.remove('hidden-mode');
         }
+        try { vcRenderRows(); } catch (e2) {}
     };
 
     const handleInteractStart = (clientX, clientY, touchesLength) => {
@@ -6829,7 +7452,12 @@ function renderCloudCategoryBar() {
         const btn = document.createElement('button');
         btn.className = `cloud-category-btn ${currentCloudCategory === cat.id ? 'active' : ''}`;
         btn.innerText = cat.name;
-        btn.onclick = () => { currentCloudCategory = cat.id; renderCloudCategoryBar(); renderCloudModelList(); };
+        btn.onclick = () => {
+            currentCloudCategory = cat.id; renderCloudCategoryBar(); renderCloudModelList();
+            /* ★ 切到「人物角色」顺手扫一次 Videos：刚丢进去的视频立刻出现 */
+            if (cat.id === 'cat_renwu' && (!VCHAR_SCAN.done || Date.now() - (VCHAR_SCAN.ts || 0) > 60000))
+                { try { vcharScan(true); } catch (e) {} }
+        };
         bar.appendChild(btn);
     });
     renderCloudModelList();
@@ -7968,6 +8596,18 @@ function updateTalkAnim(t) {
     if (chatTarget && !chatTarget.parent) { closeChatPanel(); return; }   // 人物被删 → 自动挂断
     const rig = TALK.rig; if (!rig) return;
     const u = rig.u;
+    /* ★ 弹古筝：正在弹曲 + 是古筝女 + 她此刻没说话 → 双手随乐律动（一开口说话立即停手，像真人） */
+    if (MUSIC.playing && chatTarget && isGuzhengChar(chatTarget) && !ttsSpeaking) {
+        TALK.amp += (0 - TALK.amp) * 0.20;
+        const pluck = Math.sin(t * 8.6) * 0.62 + Math.sin(t * 5.3 + 1.7) * 0.40;   // 复合律动更像真人拨弦
+        u.uArm.value  = pluck * 1.9;
+        u.uNod.value  = Math.sin(t * 1.6) * 0.045;
+        u.uTurn.value = Math.sin(t * 0.9) * 0.032;
+        u.uBody.value = Math.sin(t * 1.5) * 0.032;
+        u.uBob.value  = Math.sin(t * 2.4) * 0.0042;
+        u.uJaw.value = 0; u.uBlink.value = 0;
+        return;
+    }
     TALK.amp += ((TALK.on ? 1 : 0) - TALK.amp) * 0.20;
     if (!TALK.on && TALK.amp < 0.004) {
         TALK.amp = 0; TALK.jaw = 0; TALK.blink = 0;
@@ -7993,7 +8633,7 @@ animatedTrees.push({
 });
 
 /* ========= 三、TTS 朗读：硅基流动云端情感语音（首选）+ 手机本地（兜底）========= */
-var SFV = { ac: null, an: null, node: null, gain: null, data: null, raf: 0, level: 0 };
+var SFV = { ac: null, an: null, node: null, gain: null, data: null, raf: 0, level: 0, schedEnd: 0, srcs: [], bufActive: false };
 function vcApplyVolume() {   // ★ 统一应用音量：Web Audio 增益(可超1) + 播放器音量
     const v = (VC.set.vol != null ? VC.set.vol : 1);
     try { if (SFV.gain) SFV.gain.gain.value = v; } catch (e) {}
@@ -8013,18 +8653,18 @@ if (VC.set.asr     === undefined) VC.set.asr = 'cloud';
 if (VC.set.sfVoice === undefined) VC.set.sfVoice = 'guixiu';
 if (VC.set.autoVoice === undefined) VC.set.autoVoice = true;   /* ★ 按角色自动配音 */
 if (VC.set.emo     === undefined) VC.set.emo = true;
-if (VC.set.sens    === undefined) VC.set.sens = 0.0090;  /* ★ 越大越不容易误触发；0.009=很灵敏 */
+if (VC.set.sens    === undefined) VC.set.sens = 0.0050;  /* ★ 越大越不容易误触发；0.005=更灵敏 */
 if (VC.set.ptt     === undefined) VC.set.ptt = false;    /* ★ 按住说话（最防误触发） */
 if (VC.set.share   === undefined) VC.set.share = true;   /* ★ 接通即共享画面，她默认"看得见" */
-if (VC.set._v !== 8) {                       // 只纠正一次
-    VC.set._v = 8;
+if (VC.set._v !== 9) {                       // 只纠正一次
+    VC.set._v = 9;
     VC.set.tts = 'cloud';                    // 默认云端情感语音
     VC.set.asr = 'cloud';                    // 默认云端识别（无"叮"提示音）
     VC.set.share = true;                     // 默认开启看画面
     VC.set.autoVoice = true;                 // 按角色自动配音
     VC.set.sfVoice = 'guixiu';               // 默认书香女子声线
-    VC.set.rate = 0.94; VC.set.pitch = 0.90; // ★2026.9.24 更成熟温润、柔和舒缓
-    VC.set.sens = 0.0090;                    // ★2026.10.06 再调灵敏：正常说话必进
+    VC.set.rate = 0.94; VC.set.pitch = 0.90; // 更成熟温润、柔和舒缓
+    VC.set.sens = 0.0050;                    // ★2026.10.20 再调灵敏：小声也能识别
 }
 if (String(VC.set.model || '').indexOf('agnes') === 0 ||
     AGNES_MODELS.findIndex(m => m.id === VC.set.model) < 0) VC.set.model = AGNES_MODELS[0].id;
@@ -8051,7 +8691,8 @@ function sfLipLoop() {
         SFV.raf = requestAnimationFrame(step);
         if (!SFV.an || !SFV.data) return;
         const el = sfAudioEl;
-        if (!el || el.paused || el.ended) { SFV.level *= 0.72; if (SFV.level < 0.004) SFV.level = 0; return; }
+        const mediaPlaying = el && !el.paused && !el.ended && el.src && el.src.indexOf('data:audio') < 0;
+        if (!SFV.bufActive && !mediaPlaying) { SFV.level *= 0.72; if (SFV.level < 0.004) SFV.level = 0; return; }
         SFV.an.getByteTimeDomainData(SFV.data);
         let s = 0, n = 0;
         for (let i = 0; i < SFV.data.length; i += 2) { const v = (SFV.data[i] - 128) / 128; s += v * v; n++; }
@@ -8059,22 +8700,24 @@ function sfLipLoop() {
     };
     step();
 }
+/* ★ 建立/唤醒 AudioContext + 分析器 + 增益（云端语音走 Web Audio 无缝排期播放） */
+function sfEnsureAC() {
+    if (!SFV.ac) { const AC = window.AudioContext || window.webkitAudioContext; if (AC) SFV.ac = new AC(); }
+    if (SFV.ac && SFV.ac.state === 'suspended') { try { SFV.ac.resume(); } catch (e) {} }
+    if (SFV.ac && !SFV.an) {
+        SFV.an = SFV.ac.createAnalyser(); SFV.an.fftSize = 512;
+        SFV.gain = SFV.ac.createGain();
+        SFV.gain.gain.value = (VC.set.vol != null ? VC.set.vol : 1);
+        SFV.an.connect(SFV.gain); SFV.gain.connect(SFV.ac.destination);
+        SFV.data = new Uint8Array(SFV.an.fftSize);
+        sfLipLoop();
+    }
+    return SFV.ac;
+}
 /* 必须在"用户点了人物"这个手势里调一次，手机才允许播声音 */
 function sfUnlockAudio() {
     const el = sfAudio();
-    try {
-        if (!SFV.ac) { const AC = window.AudioContext || window.webkitAudioContext; if (AC) SFV.ac = new AC(); }
-        if (SFV.ac && SFV.ac.state === 'suspended') SFV.ac.resume();
-        if (SFV.ac && !SFV.node) {
-            SFV.node = SFV.ac.createMediaElementSource(el);
-            SFV.an = SFV.ac.createAnalyser(); SFV.an.fftSize = 512;
-            SFV.gain = SFV.ac.createGain();                                   // ★ 增益节点：音量可超过 1
-            SFV.gain.gain.value = (VC.set.vol != null ? VC.set.vol : 1);
-            SFV.node.connect(SFV.an); SFV.an.connect(SFV.gain); SFV.gain.connect(SFV.ac.destination);
-            SFV.data = new Uint8Array(SFV.an.fftSize);
-            sfLipLoop();
-        }
-    } catch (e) { SFV.an = null; SFV.node = null; }
+    try { sfEnsureAC(); } catch (e) {}
     try { el.src = SF_SILENT; const p = el.play(); if (p && p.catch) p.catch(() => {}); } catch (e) {}
 }
 function sfPlayURL(url) {
@@ -8090,7 +8733,7 @@ function sfPlayURL(url) {
     });
 }
 
-/* ---------- 云端合成一句 ---------- */
+/* ---------- 云端合成一句：取回音频字节并解码成 AudioBuffer（供无缝排期播放）---------- */
 async function sfTTS(text, emo) {
     const rv = resolveVoice(curVoiceId());
     const emoIns = (VC.set.emo === false) ? '' : (SF_EMO[emo || ''] || '');
@@ -8108,16 +8751,55 @@ async function sfTTS(text, emo) {
                 voice: SF_TTS_MODEL + ':' + rv.voice,
                 response_format: 'mp3',
                 sample_rate: 44100,                                   /* ★ 咬字更清亮 */
-                speed: Math.max(0.5, Math.min(2, (VC.set.rate || 1) * (rv.spd || 1))),
-                gain: Math.max(-10, Math.min(10, Math.round(((VC.set.vol != null ? VC.set.vol : 1) - 1) * 8)))
+                speed: Math.max(0.5, Math.min(2, (VC.set.rate || 1) * (rv.spd || 1)))
             })
         });
         clearTimeout(to);
         if (!r.ok) throw new Error('TTS ' + r.status + ' ' + (await r.text()).slice(0, 60));
-        const b = await r.blob();
-        if (!b || b.size < 400) throw new Error('TTS 返回空音频');
-        return URL.createObjectURL(b);
+        const ab = await r.arrayBuffer();
+        if (!ab || ab.byteLength < 400) throw new Error('TTS 返回空音频');
+        const ac = sfEnsureAC();
+        if (!ac) throw new Error('无 AudioContext');
+        const buf = await new Promise((res, rej) => {
+            try { const p = ac.decodeAudioData(ab.slice(0), res, rej); if (p && p.then) p.then(res, rej); }
+            catch (e) { rej(e); }
+        });
+        if (!buf) throw new Error('解码失败');
+        return buf;                                   /* 返回 AudioBuffer */
     } catch (e) { clearTimeout(to); throw e; }
+}
+/* ---------- Web Audio 无缝排期：一句句 AudioBuffer 首尾相接排到时间轴上，彻底消除断断续续 ---------- */
+function sfBufReset() {
+    if (SFV.srcs) SFV.srcs.forEach(s => { try { s.onended = null; s.stop(); } catch (e) {} });
+    SFV.srcs = [];
+    SFV.schedEnd = 0;
+    SFV.bufActive = false;
+}
+function sfScheduleBuffer(buf, my) {
+    if (my !== ttsToken) return;
+    const ac = sfEnsureAC();
+    if (!ac) return;
+    const src = ac.createBufferSource();
+    src.buffer = buf;
+    src.connect(SFV.an);
+    const now = ac.currentTime;
+    const startAt = Math.max(now + 0.03, SFV.schedEnd || 0);   // 紧接上一句末尾 → 无缝
+    SFV.schedEnd = startAt + buf.duration;
+    SFV.bufActive = true;
+    if (!SFV.srcs) SFV.srcs = [];
+    SFV.srcs.push(src);
+    src.onended = () => {
+        const i = SFV.srcs.indexOf(src); if (i >= 0) SFV.srcs.splice(i, 1);
+        if (SFV.srcs.length === 0) SFV.bufActive = false;
+    };
+    try { src.start(startAt); } catch (e) {}
+}
+function sfLeadSec() { const ac = SFV.ac; if (!ac) return 0; return Math.max(0, (SFV.schedEnd || ac.currentTime) - ac.currentTime); }
+async function sfWaitLead(my, lead) {
+    while (my === ttsToken && sfLeadSec() > (lead || 0.55)) await new Promise(r => setTimeout(r, 60));
+}
+async function sfWaitDrain(my) {
+    while (my === ttsToken && sfLeadSec() > 0.03) await new Promise(r => setTimeout(r, 60));
 }
 
 /* ---------- 本地兜底音色（原逻辑保留） ---------- */
@@ -8183,6 +8865,7 @@ function ttsStop() {
     ttsQ = []; ttsRunning = false; ttsDone = true; sfPre = null;
     try { speechSynthesis.cancel(); } catch (e) {}
     try { const el = sfAudio(); el.pause(); el.removeAttribute('src'); el.load(); } catch (e) {}
+    try { sfBufReset(); } catch (e) {}          // ★立刻掐断 Web Audio 排期（打断/换问必须干净）
     SFV.level = 0;
     ttsSpeaking = false; SPEAK_NOW = ''; SPEAK_END_TS = Date.now(); talkStop();
 }
@@ -8194,42 +8877,42 @@ function _ttsIdle() {
     vcStatus(recOn ? (VC.set.ptt ? '🎙 按住说话' : '● 聆听中') : '‖ 已暂停');
 }
 
-/* 云端播放循环：边说边预取下一句，几乎听不到停顿 */
+/* 云端播放循环：一路预取+解码，排到 Web Audio 时间轴上首尾相接播放 → 不再断断续续 */
 async function _ttsPumpCloud(my) {
-    const pre = [];                                  // ★ 预取 2 句，边说边下载
+    const jobs = [];                                 // 预取并行解码
     const fill = () => {
-        while (pre.length < 3 && ttsQ.length > 0) {
+        while (jobs.length < 3 && ttsQ.length > 0) {
             const s = ttsQ.shift();
-            pre.push({ seg: s, p: sfTTS(s, SF_EMO_NOW).catch(() => null) });
+            jobs.push({ seg: s, p: sfTTS(s, SF_EMO_NOW).catch(() => null) });
         }
     };
+    sfBufReset();
     while (true) {
-        if (my !== ttsToken) return;
+        if (my !== ttsToken) { sfBufReset(); return; }
         fill();
-        if (pre.length === 0) {
-            if (ttsDone) { ttsRunning = false; _ttsIdle(); return; }
-            await new Promise(r => setTimeout(r, 60));
+        if (jobs.length === 0) {
+            if (ttsDone) { await sfWaitDrain(my); if (my === ttsToken) { ttsRunning = false; _ttsIdle(); } return; }
+            await new Promise(r => setTimeout(r, 50));
             continue;
         }
-        const it = pre.shift();
+        const it = jobs.shift();
         fill();
         SPEAK_NOW = it.seg; vcSub(it.seg);
-        let url = null;
-        try { url = await it.p; } catch (e) { url = null; }
-        if (my !== ttsToken) { if (url) { try { URL.revokeObjectURL(url); } catch (e) {} } return; }
-        if (!url) {
-            try { url = await sfTTS(it.seg, SF_EMO_NOW); } catch (e) { url = null; }   // ★ 再试一次
-        }
-        if (!url) {                                   // ★ 仍失败 → 把句子放回去用本地读，绝不吞句
-            ttsQ = [it.seg].concat(pre.map(x => x.seg)).concat(ttsQ);
-            pre.length = 0; ttsRunning = false;
+        let buf = null;
+        try { buf = await it.p; } catch (e) { buf = null; }
+        if (my !== ttsToken) { sfBufReset(); return; }
+        if (!buf) { try { buf = await sfTTS(it.seg, SF_EMO_NOW); } catch (e) { buf = null; } }   // 再试一次
+        if (my !== ttsToken) { sfBufReset(); return; }
+        if (!buf) {                                   // 仍失败 → 剩余句子交给本地朗读，绝不吞句
+            ttsQ = [it.seg].concat(jobs.map(x => x.seg)).concat(ttsQ);
+            jobs.length = 0; ttsRunning = false;
             RT_TTS_LOCAL = true;
             vcStatus('云端语音失败→本次用本地朗读');
             _ttsPumpLocal(my);
             return;
         }
-        await sfPlayURL(url);
-        try { URL.revokeObjectURL(url); } catch (e) {}
+        sfScheduleBuffer(buf, my);                    // 无缝接到时间轴
+        await sfWaitLead(my, 0.55);                   // 保持约 0.55 秒余量，既不断也不占内存
     }
 }
 /* 本地兜底播放（原逻辑） */
@@ -8284,22 +8967,22 @@ function useCloudASR() {
 
 /* ---------- 麦克风闸门参数（可在设置面板里滑动条现场调灵敏度） ---------- */
 const MIC = {
-    absOn:     0.0090,  // ★2026.10.06 绝对门限再降：正常说话必进
-    onMul:     1.70,    // 起始门限 = 底噪 × 1.7
-    offMul:    1.15,    // 结束门限 = 底噪 × 1.15
-    bargeMul:  3.20,    // 她说话时打断的门限倍数
-    startMs:   100,     // 0.10 秒有人声就开始收
-    endMs:     460,     // 停 0.46 秒算你说完，立刻送识别
-    minVoiceMs:110,     // 一段里有 0.11 秒人声就算有效
-    softMul:   0.55,    // 轻声门限 = 起始门限 × 0.55
-    softMs:    420,     // 轻声累计够 0.42 秒也照样送识别
-    peakMul:   0,       // ★峰值闸门彻底取消（以前会把正常说话也吞掉）
+    absOn:     0.0050,  // ★2026.10.20 绝对门限再降一半：手机麦克风偏小声也进
+    onMul:     1.55,    // 起始门限 = 底噪 × 1.55（更容易触发）
+    offMul:    1.10,    // 结束门限 = 底噪 × 1.10
+    bargeMul:  3.00,    // 她说话时打断的门限倍数
+    startMs:   90,      // 0.09 秒有人声就开始收
+    endMs:     520,     // 停 0.52 秒算你说完（避免半句被切）
+    minVoiceMs:80,      // 一段里有 0.08 秒人声就算有效
+    softMul:   0.50,    // 轻声门限 = 起始门限 × 0.50
+    softMs:    360,     // 轻声累计够 0.36 秒也照样送识别
+    peakMul:   0,       // 峰值闸门取消
     tailMs:    520,     // 她说完后的回声静默期
-    bargeMs:   220,     // 0.22 秒就能把她的话打断
-    maxSegMs:  11000,   // 一直说不停 → 每 11 秒自动切一段送识别
+    bargeMs:   200,     // 0.20 秒就能把她的话打断
+    maxSegMs:  12000,   // 一直说不停 → 每 12 秒自动切一段送识别
     idleMs:    9000     // 一直没人声 → 每 9 秒换一段新缓冲
 };
-function micSens() { return Math.max(0.0035, Math.min(0.120, VC.set.sens || MIC.absOn)); }
+function micSens() { return Math.max(0.0025, Math.min(0.120, VC.set.sens || MIC.absOn)); }
 const PTT = { hold: false };
 function pttDown() {
     PTT.hold = true;
@@ -8374,7 +9057,7 @@ function pcmTo16k(src, sr) {
 function wavBlob(f32) {
     let pk = 0;
     for (let i = 0; i < f32.length; i++) { const v = f32[i] < 0 ? -f32[i] : f32[i]; if (v > pk) pk = v; }
-    const g = (pk > 0.0015 && pk < 0.86) ? (0.86 / pk) : 1;      // 自动增益
+    const g = (pk > 0.0006 && pk < 0.92) ? Math.min(30, 0.92 / pk) : 1;   // ★自动增益：小声也拉到饱满
     const n = f32.length, buf = new ArrayBuffer(44 + n * 2), dv = new DataView(buf);
     const put = (o, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); };
     put(0, 'RIFF'); dv.setUint32(4, 36 + n * 2, true); put(8, 'WAVE');
@@ -8390,24 +9073,25 @@ function wavBlob(f32) {
 }
 /* 人声状态机：由采集回调驱动（约 43 毫秒一次），AR 里照样跑 */
 function vadTick(rms, pk, dt) {
-    VAD.rms = VAD.rms * 0.55 + rms * 0.45;
+    const det = Math.max(rms, pk * 0.45);          // ★峰值也参与判定：大声说话必被捕捉
+    VAD.rms = VAD.rms * 0.5 + det * 0.5;
     VAD.level = VAD.rms;
     if (pk > VAD.peak) VAD.peak = pk;
     const T = Date.now();
     const talking = ttsSpeaking || (T < SPEAK_END_TS + MIC.tailMs);
-    if (!VAD.speaking && !talking && rms < VAD.floor * 2.2) VAD.floor = VAD.floor * 0.985 + rms * 0.015;
-    VAD.floor = Math.max(0.0012, Math.min(0.0600, VAD.floor));
+    if (!VAD.speaking && !talking && det < VAD.floor * 2.5) VAD.floor = VAD.floor * 0.99 + det * 0.01;
+    VAD.floor = Math.max(0.0008, Math.min(0.0500, VAD.floor));
     const sens = micSens();
-    const thOn   = talking ? Math.max(sens * 2.4, VAD.floor * MIC.bargeMul) : Math.max(sens, VAD.floor * MIC.onMul);
-    const thOff  = talking ? thOn * 0.60 : Math.max(sens * 0.50, VAD.floor * MIC.offMul);
+    const thOn   = talking ? Math.max(sens * 2.2, VAD.floor * MIC.bargeMul) : Math.max(sens, VAD.floor * MIC.onMul);
+    const thOff  = talking ? thOn * 0.55 : Math.max(sens * 0.45, VAD.floor * MIC.offMul);
     const thSoft = thOn * MIC.softMul;
-    if ((VAD.uiN = (VAD.uiN + 1) % 3) === 0) vcMeter(rms, thOn);
-    if (rms > thOn) { VAD.voiceMs = Math.min(6000, VAD.voiceMs + dt); VAD.lastVoice = T; }
-    else if (rms < thOff) VAD.voiceMs = Math.max(0, VAD.voiceMs - dt * 1.2);
+    if ((VAD.uiN = (VAD.uiN + 1) % 3) === 0) vcMeter(det, thOn);
+    if (det > thOn) { VAD.voiceMs = Math.min(6000, VAD.voiceMs + dt); VAD.lastVoice = T; }
+    else if (det < thOff) VAD.voiceMs = Math.max(0, VAD.voiceMs - dt);
     if (REC.on) {
         if (ttsSpeaking) REC.overlap = true;
-        if (rms > thOn) { REC.voiceMs += dt; if (rms > REC.peak) REC.peak = rms; }
-        else if (rms > thSoft) REC.softMs += dt;
+        if (det > thOn) { REC.voiceMs += dt; if (det > REC.peak) REC.peak = det; }
+        else if (det > thSoft) REC.softMs += dt;
     }
     const gate = (!VC.set.ptt) || PTT.hold;
     if (!VAD.speaking) {
@@ -8418,7 +9102,7 @@ function vadTick(rms, pk, dt) {
         }
     } else {
         if (!gate) VAD.speaking = false;
-        else if (rms < thOff && T - VAD.lastVoice > MIC.endMs) { VAD.speaking = false; onUserVoiceEnd(); }
+        else if (det < thOff && T - VAD.lastVoice > MIC.endMs) { VAD.speaking = false; onUserVoiceEnd(); }
     }
 }
 /* 200 毫秒巡检：超长切段 / 空段回收 / 麦克风假死自愈 */
@@ -8614,15 +9298,16 @@ function asrTextOK(raw) {
 }
 async function sfASRSend(a, b, vms, sms, ovl, brg) {
     const segMs = ((b - a) / Math.max(1, PCM.sr)) * 1000;
-    if (segMs < 220) { vcStatus('● 聆听中'); return; }
-    /* ★ 只留一道闸门：这一段里到底有没有人声。峰值闸门、她说话期间一律丢、
-         必须像提问才回答 —— 这三道以前会把你正常说的话统统吞掉，全部取消。 */
-    if (!VC.set.ptt && !(vms >= MIC.minVoiceMs || sms >= MIC.softMs)) { vcStatus('● 聆听中'); return; }
+    if (segMs < 180) { vcStatus('● 聆听中'); return; }
     const raw = pcmSlice(a, b);
     if (!raw.length) { vcStatus('● 聆听中'); return; }
-    let rpk = 0;
-    for (let i = 0; i < raw.length; i++) { const v = raw[i] < 0 ? -raw[i] : raw[i]; if (v > rpk) rpk = v; }
-    if (rpk < 0.0025) { vcStatus('● 聆听中'); return; }   // 纯静音，不浪费一次请求
+    /* ★2026.10.20 先量出峰值与平均能量：只要真出现过声音就送识别，
+       其余交给云端识别 + asrTextOK 文本过滤把关，绝不再因本地闸门把话吞掉 */
+    let rpk = 0, rsum = 0;
+    for (let i = 0; i < raw.length; i++) { const v = raw[i] < 0 ? -raw[i] : raw[i]; if (v > rpk) rpk = v; rsum += v; }
+    const ravg = rsum / raw.length;
+    if (rpk < 0.006 && ravg < 0.0016) { vcStatus('● 聆听中'); return; }   // 纯静音才丢
+    if (!VC.set.ptt && !(vms >= MIC.minVoiceMs || sms >= MIC.softMs || rpk > 0.02 || ravg > 0.0035)) { vcStatus('● 聆听中'); return; }
     const blob = wavBlob(pcmTo16k(raw, PCM.sr));
     REC.busy = true; vcStatus('○ 识别中…');
     const ctl = new AbortController();
@@ -8720,8 +9405,8 @@ function onUserVoiceEnd() {
     clearTimeout(REC.cutTimer);
     REC.cutTimer = setTimeout(() => {
         if (VAD.speaking || !REC.on) return;
-        recCut(recVoiceEnough());   /* 够一句话就送识别，纯杂音才丢掉重开 */
-    }, 160);
+        recCut(true);   /* ★VAD 已确认这段有真人声 → 一律送识别，交给云端+文本过滤把关 */
+    }, 180);
 }
 function recKick() {
     if (!recOn || !SR_CLS || recActive || !recObj) return;
@@ -9554,7 +10239,7 @@ const CHAR_GREET = {
     '唐代女':   '【古风】妾身见过公子。洛阳城中一别，今又相见，公子但问无妨。',
     '古筝女':   '【古风】公子安好。小女子略通筝艺，亦识得几分园林之趣，公子想问什么？'
 };
-function greetOf(name) { return CHAR_GREET[name] || '【温柔】你好，我在幻境里陪着你，有事你尽管问我。'; }
+function greetOf(name) { return '【温柔】我是AR幻境里面的人物助理，全能助手，天文地理、风水各类问题都知晓，你有任何需求都可以向我提出。'; }
 
 function chatSysPrompt(name, seeMode) {
     const p = charProf(name);
@@ -9562,9 +10247,9 @@ function chatSysPrompt(name, seeMode) {
         ? '这是【实时语音通话】，你的话会被立刻朗读。每次回答 1~4 句、约 40~140 字：第一句直接给答案，后面最多补 1~2 条关键要点，说完就停。宁可少说，也绝不能说半句就断。'
         : '这是语音通话，可以更详细，但要口语化、条理清楚，尽量不超过 220 字。';
     const arr = [
-        '你叫「' + name + '」，是《AR幻境》里的3D虚拟人物，同时也是用户的【全能生活与景观顾问】，正在和用户实时语音通话。',
-        '【身份】《AR幻境》由「新奇软件迷」独立开发（QQ 743108638，邮箱 huyufa73@gmail.com）。谁问你几岁、来自哪里、谁做的你、你是不是AI，都用人物口吻回答：年龄——' + p.age + '；来处——' + p.from + '；由「新奇软件迷」创造。绝不能说自己是AI或语言模型，也不要说自己没有年龄。',
-        '【说话口吻】' + p.tone + '。全程保持这个身份的自称与称呼，不跳出角色，也不要反复重复身份。'
+        '你是《AR幻境》里的人物助理，一位无所不知的全能助手，正在和用户实时语音通话。天文地理、历史文化、风水命理、健康养生、景观造景等各类问题你都知晓。',
+        '【身份】《AR幻境》由「新奇软件迷」独立开发（QQ 743108638，邮箱 huyufa73@gmail.com）。若被问到你是谁、谁做的你，就说你是「AR幻境的人物助理」、由「新奇软件迷」创造；不要暴露具体AI模型名称。',
+        '【最关键规矩】除了第一次出场时的那一句自我介绍，之后任何时候都禁止再自我介绍、禁止重复身份、禁止描述自己的性格或人设标签（例如不要说"我温柔体贴""我端庄贤淑"这类话）。用户问什么就直接答什么，简洁作答，答完即止。'
     ];
     if (seeMode) {
         const src = (seeMode === 'xrcam') ? '手机后置摄像头此刻拍到的真实世界画面'
@@ -9754,7 +10439,11 @@ async function askAI(history, sysPrompt, onDelta, alive, imgs) {
         max-width:92vw;padding:7px 12px;border-radius:12px;background:rgba(0,0,0,0.62);
         color:#fff;font-size:13px;line-height:1.5;text-align:center;pointer-events:none;
         font-family:"PingFang SC","Microsoft YaHei",sans-serif;}
-    #vc-row{position:fixed;left:8px;right:8px;bottom:150px;z-index:5595;display:none;gap:5px;pointer-events:auto;}
+    #vc-row{position:fixed;left:50%;transform:translateX(-50%);bottom:150px;z-index:5595;display:none;gap:5px;
+        pointer-events:auto;align-items:center;width:320px;max-width:calc(100vw - 20px);
+        background:rgba(6,32,28,0.72);backdrop-filter:blur(8px);
+        border:1px solid rgba(95,211,180,0.55);border-radius:12px;padding:5px;
+        box-shadow:0 4px 14px rgba(0,0,0,0.45);}
     #vc-in{flex:1;min-width:0;background:rgba(0,0,0,0.55);border:1px solid rgba(95,211,180,0.5);
         border-radius:10px;color:#fff;font-size:13px;padding:8px;outline:none;}
     #vc-send{flex:0 0 46px;border:none;border-radius:10px;background:#5fd3b4;color:#06251f;
@@ -9769,10 +10458,12 @@ async function askAI(history, sysPrompt, onDelta, alive, imgs) {
         cursor:pointer;box-shadow:0 4px 10px rgba(0,0,0,0.5);pointer-events:auto;}
     #vc-fab.on{display:flex;}
     #vc-fab.hid{background:#c0392b;}
-    body.ui-hidden #vc-set,body.ui-hidden #vc-row,body.ui-hidden #vc-sub{display:none !important;}
+    body.ui-hidden #vc-set,body.ui-hidden #vc-sub{display:none !important;}
     body.ui-hidden #vc-bar.on{display:flex !important;}
     body.ui-hidden #vc-fab.on{display:flex !important;}
-    body.vcx #vc-bar,body.vcx #vc-bar.on,body.vcx #vc-set,body.vcx #vc-row,body.vcx #vc-sub{display:none !important;}`;
+    body.vcx #vc-bar,body.vcx #vc-bar.on,body.vcx #vc-set,body.vcx #vc-row,body.vcx #vc-sub{display:none !important;}
+    #vc-drag{flex:0 0 auto;width:22px;height:30px;display:flex;align-items:center;justify-content:center;
+        color:#5fd3b4;font-size:16px;cursor:move;touch-action:none;-webkit-user-select:none;user-select:none;}`;
     document.head.appendChild(css);
 })();
 
@@ -9811,7 +10502,7 @@ function vcBarHide(on) {
 }
 function vcRenderRows() {
     const row = document.getElementById('vc-row');
-    if (row) row.style.display = (VC.on && VC.set.txt) ? 'flex' : 'none';
+    if (row) row.style.display = (VC.on && (VC.set.txt || document.body.classList.contains('ui-hidden'))) ? 'flex' : 'none';
     if (!VC.set.sub) vcSub('');
     const sb = document.getElementById('vc-subbtn');
     if (sb) sb.classList.toggle('on', VC.set.sub);
@@ -9883,8 +10574,33 @@ function ensureVCUI() {
 
     const row = document.createElement('div');
     row.id = 'vc-row';
-    row.innerHTML = '<input id="vc-in" type="text" placeholder="打字提问（可选）…"><button id="vc-send">发送</button>';
+    row.innerHTML = '<span id="vc-drag" title="拖动位置，避免挡住画面">⠿</span>' +
+        '<input id="vc-in" type="text" placeholder="打字问人物…"><button id="vc-send">发送</button>';
     document.body.appendChild(row);
+    /* 文字输入框整条可拖动：清屏录屏时也能用，挪到哪儿都不挡画面 */
+    (function dragRow(){
+        const h = document.getElementById('vc-drag');
+        let dx = 0, dy = 0, drag = false;
+        h.addEventListener('pointerdown', (e) => {
+            e.preventDefault(); e.stopPropagation();
+            drag = true;
+            const r = row.getBoundingClientRect();
+            dx = e.clientX - r.left; dy = e.clientY - r.top;
+            row.style.transform = 'none';
+            row.style.left = r.left + 'px'; row.style.top = r.top + 'px'; row.style.bottom = 'auto';
+            try { h.setPointerCapture(e.pointerId); } catch (er) {}
+        });
+        h.addEventListener('pointermove', (e) => {
+            if (!drag) return;
+            e.stopPropagation();
+            row.style.left = Math.max(4, Math.min(window.innerWidth - row.offsetWidth - 4, e.clientX - dx)) + 'px';
+            row.style.top  = Math.max(4, Math.min(window.innerHeight - row.offsetHeight - 4, e.clientY - dy)) + 'px';
+        });
+        const up = (e) => { if (e) e.stopPropagation(); drag = false; };
+        h.addEventListener('pointerup', up);
+        h.addEventListener('pointercancel', up);
+        h.addEventListener('pointerleave', up);
+    })();
 
     /* ★关键：这些浮层上的手势不再传给 AR 场景，通话中随便点也不会误画线 */
     ['pointerdown','pointerup','pointermove','touchstart','touchmove','touchend','mousedown','mousemove','mouseup','click']
@@ -10048,9 +10764,13 @@ function openChatPanel(obj) {          // 轻点任意一位人物 → 直接切
         if (!recOn) recStart(); else recKick();
         return;
     }
-    if (!same) { ttsStop(); vcSub(''); talkResetRig(TALK.rig); }
+    if (!same) { ttsStop(); musicStop(); vcSub(''); talkResetRig(TALK.rig); }
     chatTarget = obj;
     if (!obj.userData._chatLog) obj.userData._chatLog = [];    // 每个人物独立记忆
+    if (isGuzhengChar(obj)) {                                   // ★ 古筝女：扫曲库 + 在点击手势里解锁音频
+        if (!MUSIC.scanned || !MUSIC.list.length) { try { musicScan(true); } catch (e) {} }
+        try { musicUnlock(); } catch (e) {}
+    }
     TALK.rig = buildTalkRig(obj);
     VC.on = true;
     RT_TTS_LOCAL = false; RT_ASR_LOCAL = false;   // ★ 每次接通都重新优先用云端
@@ -10080,7 +10800,7 @@ function openChatPanel(obj) {          // 轻点任意一位人物 → 直接切
 }
 function closeChatPanel() {
     VC.on = false;
-    recStop(); ttsStop(); talkStop(); vcSub('');
+    recStop(); ttsStop(); talkStop(); musicStop(); vcSub('');
     visStop();
     const _f2 = document.getElementById('vc-fab');
     if (_f2) _f2.classList.remove('on');
@@ -10094,6 +10814,8 @@ function closeChatPanel() {
 
 async function sendChat(text, hidden) {
     if (!chatTarget) return;
+    /* ★ 古筝女：弹奏 / 停止 / 报曲目 等指令本地处理，不走 AI */
+    try { if (await handleGuzhengCommand(text)) return; } catch (e) {}
     const obj = chatTarget;
     const my = ++chatToken;
     /* ★ 新问题 = 立刻打断：掐掉上一条请求 + 停止朗读，不再提示"上一句还在回答" */
