@@ -8596,8 +8596,8 @@ function updateTalkAnim(t) {
     if (chatTarget && !chatTarget.parent) { closeChatPanel(); return; }   // 人物被删 → 自动挂断
     const rig = TALK.rig; if (!rig) return;
     const u = rig.u;
-    /* ★ 弹古筝：正在弹曲 + 是古筝女 + 她此刻没说话 → 双手随乐律动（一开口说话立即停手，像真人） */
-    if (MUSIC.playing && chatTarget && isGuzhengChar(chatTarget) && !ttsSpeaking) {
+    /* ★ 弹古筝：正在弹曲 + 是古筝女 → 全程保持弹奏动作（AI回复时只压低音乐音量，绝不停手/不切状态） */
+    if (MUSIC.playing && chatTarget && isGuzhengChar(chatTarget)) {
         TALK.amp += (0 - TALK.amp) * 0.20;
         const pluck = Math.sin(t * 8.6) * 0.62 + Math.sin(t * 5.3 + 1.7) * 0.40;   // 复合律动更像真人拨弦
         u.uArm.value  = pluck * 1.9;
@@ -8653,7 +8653,7 @@ if (VC.set.asr     === undefined) VC.set.asr = 'cloud';
 if (VC.set.sfVoice === undefined) VC.set.sfVoice = 'guixiu';
 if (VC.set.autoVoice === undefined) VC.set.autoVoice = true;   /* ★ 按角色自动配音 */
 if (VC.set.emo     === undefined) VC.set.emo = true;
-if (VC.set.sens    === undefined) VC.set.sens = 0.0050;  /* ★ 越大越不容易误触发；0.005=更灵敏 */
+if (VC.set.sens    === undefined) VC.set.sens = 0.0030;  /* ★ 越大越不容易误触发；0.003=默认更灵敏 */
 if (VC.set.ptt     === undefined) VC.set.ptt = false;    /* ★ 按住说话（最防误触发） */
 if (VC.set.share   === undefined) VC.set.share = true;   /* ★ 接通即共享画面，她默认"看得见" */
 if (VC.set._v !== 9) {                       // 只纠正一次
@@ -8666,6 +8666,8 @@ if (VC.set._v !== 9) {                       // 只纠正一次
     VC.set.rate = 0.94; VC.set.pitch = 0.90; // 更成熟温润、柔和舒缓
     VC.set.sens = 0.0050;                    // ★2026.10.20 再调灵敏：小声也能识别
 }
+/* ★ 2026.9.16：单独把麦克风灵敏度再下调一档（只强制一次，绝不动语速/音色/其它任何设置） */
+if (VC.set._micv !== 2) { VC.set._micv = 2; VC.set.sens = 0.0030; }
 if (String(VC.set.model || '').indexOf('agnes') === 0 ||
     AGNES_MODELS.findIndex(m => m.id === VC.set.model) < 0) VC.set.model = AGNES_MODELS[0].id;
 vcSave();
@@ -8967,18 +8969,18 @@ function useCloudASR() {
 
 /* ---------- 麦克风闸门参数（可在设置面板里滑动条现场调灵敏度） ---------- */
 const MIC = {
-    absOn:     0.0050,  // ★2026.10.20 绝对门限再降一半：手机麦克风偏小声也进
-    onMul:     1.55,    // 起始门限 = 底噪 × 1.55（更容易触发）
-    offMul:    1.10,    // 结束门限 = 底噪 × 1.10
-    bargeMul:  3.00,    // 她说话时打断的门限倍数
-    startMs:   90,      // 0.09 秒有人声就开始收
-    endMs:     520,     // 停 0.52 秒算你说完（避免半句被切）
-    minVoiceMs:80,      // 一段里有 0.08 秒人声就算有效
-    softMul:   0.50,    // 轻声门限 = 起始门限 × 0.50
-    softMs:    360,     // 轻声累计够 0.36 秒也照样送识别
+    absOn:     0.0028,  // ★2026.9.16 更灵敏：手机麦克风偏小声也稳稳收得到
+    onMul:     1.35,    // 起始门限 = 底噪 × 1.35（更容易触发）
+    offMul:    1.05,    // 结束门限 = 底噪 × 1.05
+    bargeMul:  2.40,    // 她说话时打断的门限倍数（你一开口更容易打断她）
+    startMs:   55,      // 0.055 秒有人声就开始收（更跟手）
+    endMs:     650,     // 停 0.65 秒才算你说完（半句话不会被切断）
+    minVoiceMs:55,      // 一段里有 0.055 秒人声就算有效
+    softMul:   0.45,    // 轻声门限 = 起始门限 × 0.45（更能收轻声）
+    softMs:    240,     // 轻声累计够 0.24 秒也照样送识别
     peakMul:   0,       // 峰值闸门取消
-    tailMs:    520,     // 她说完后的回声静默期
-    bargeMs:   200,     // 0.20 秒就能把她的话打断
+    tailMs:    480,     // 她说完后的回声静默期
+    bargeMs:   170,     // 0.17 秒就能把她的话打断
     maxSegMs:  12000,   // 一直说不停 → 每 12 秒自动切一段送识别
     idleMs:    9000     // 一直没人声 → 每 9 秒换一段新缓冲
 };
@@ -9306,8 +9308,8 @@ async function sfASRSend(a, b, vms, sms, ovl, brg) {
     let rpk = 0, rsum = 0;
     for (let i = 0; i < raw.length; i++) { const v = raw[i] < 0 ? -raw[i] : raw[i]; if (v > rpk) rpk = v; rsum += v; }
     const ravg = rsum / raw.length;
-    if (rpk < 0.006 && ravg < 0.0016) { vcStatus('● 聆听中'); return; }   // 纯静音才丢
-    if (!VC.set.ptt && !(vms >= MIC.minVoiceMs || sms >= MIC.softMs || rpk > 0.02 || ravg > 0.0035)) { vcStatus('● 聆听中'); return; }
+    if (rpk < 0.004 && ravg < 0.0011) { vcStatus('● 聆听中'); return; }   // 只丢真正的纯静音
+    if (!VC.set.ptt && !(vms >= MIC.minVoiceMs || sms >= MIC.softMs || rpk > 0.012 || ravg > 0.0022)) { vcStatus('● 聆听中'); return; }
     const blob = wavBlob(pcmTo16k(raw, PCM.sr));
     REC.busy = true; vcStatus('○ 识别中…');
     const ctl = new AbortController();
@@ -10461,7 +10463,7 @@ async function askAI(history, sysPrompt, onDelta, alive, imgs) {
     body.ui-hidden #vc-set,body.ui-hidden #vc-sub{display:none !important;}
     body.ui-hidden #vc-bar.on{display:flex !important;}
     body.ui-hidden #vc-fab.on{display:flex !important;}
-    body.vcx #vc-bar,body.vcx #vc-bar.on,body.vcx #vc-set,body.vcx #vc-row,body.vcx #vc-sub{display:none !important;}
+    body.vcx #vc-bar,body.vcx #vc-bar.on,body.vcx #vc-set,body.vcx #vc-sub{display:none !important;}
     #vc-drag{flex:0 0 auto;width:22px;height:30px;display:flex;align-items:center;justify-content:center;
         color:#5fd3b4;font-size:16px;cursor:move;touch-action:none;-webkit-user-select:none;user-select:none;}`;
     document.head.appendChild(css);
@@ -10499,13 +10501,20 @@ function vcBarHide(on) {
     document.body.classList.toggle('vcx', !!on);
     const f = document.getElementById('vc-fab');
     if (f) { f.classList.toggle('hid', !!on); f.innerText = on ? '📞' : '🙈'; f.title = on ? '显示通话条' : '隐藏通话条'; }
+    try { vcRenderRows(); } catch (e) {}   /* ★ 隐藏/显示通话条时，输入框只按自己开关(VC.set.txt)决定，绝不被连带隐藏 */
 }
 function vcRenderRows() {
     const row = document.getElementById('vc-row');
-    if (row) row.style.display = (VC.on && (VC.set.txt || document.body.classList.contains('ui-hidden'))) ? 'flex' : 'none';
+    /* ★ 输入框显示只由它自己的开关 VC.set.txt 或「清屏」决定，
+       与「上方设置菜单」完全独立：关设置菜单绝不会连带隐藏输入框；清屏/不清屏共用这同一个输入框 */
+    /* ★ 输入框彻底独立：只认它自己的开关 VC.set.txt（下方⌨按钮 / 设置里那个开关）。
+       清屏眼睛、隐藏设置菜单、任何其它操作都绝不会连带开关它；只有用户点⌨才显示/隐藏。 */
+    if (row) row.style.display = (VC.on && VC.set.txt) ? 'flex' : 'none';
     if (!VC.set.sub) vcSub('');
     const sb = document.getElementById('vc-subbtn');
     if (sb) sb.classList.toggle('on', VC.set.sub);
+    const tb = document.getElementById('vc-txtbtn');
+    if (tb) tb.classList.toggle('on', VC.set.txt);
     vcCamUI();
 }
 
@@ -10525,6 +10534,7 @@ function ensureVCUI() {
         '<button class="vc-b" id="vc-mic" title="暂停/继续聆听">🎙</button>' +
         '<button class="vc-b" id="vc-cut" title="打断朗读">🤫</button>' +
         '<button class="vc-b" id="vc-subbtn" title="字幕开关">💬</button>' +
+        '<button class="vc-b" id="vc-txtbtn" title="文字输入框开关（清屏后也能用·独立开关）">⌨</button>' +
         '<button class="vc-b" id="vc-cam" title="共享摄像头/屏幕画面给她看">📵</button>' +
         '<button class="vc-b" id="vc-hide" title="只隐藏通话条">🙈</button>' +
         '<button class="vc-b" id="vc-cfg" title="设置">⚙</button>' +
@@ -10577,29 +10587,33 @@ function ensureVCUI() {
     row.innerHTML = '<span id="vc-drag" title="拖动位置，避免挡住画面">⠿</span>' +
         '<input id="vc-in" type="text" placeholder="打字问人物…"><button id="vc-send">发送</button>';
     document.body.appendChild(row);
-    /* 文字输入框整条可拖动：清屏录屏时也能用，挪到哪儿都不挡画面 */
+    /* 文字输入框整条可拖动（灵敏·按住立刻能拖）：清屏录屏时也能用，挪到哪儿都不挡画面 */
     (function dragRow(){
         const h = document.getElementById('vc-drag');
-        let dx = 0, dy = 0, drag = false;
-        h.addEventListener('pointerdown', (e) => {
+        let dx = 0, dy = 0, drag = false, pid = null;
+        const start = (e) => {
             e.preventDefault(); e.stopPropagation();
-            drag = true;
+            drag = true; pid = e.pointerId;
             const r = row.getBoundingClientRect();
             dx = e.clientX - r.left; dy = e.clientY - r.top;
             row.style.transform = 'none';
             row.style.left = r.left + 'px'; row.style.top = r.top + 'px'; row.style.bottom = 'auto';
             try { h.setPointerCapture(e.pointerId); } catch (er) {}
-        });
-        h.addEventListener('pointermove', (e) => {
+        };
+        const move = (e) => {
             if (!drag) return;
-            e.stopPropagation();
+            e.preventDefault(); e.stopPropagation();
             row.style.left = Math.max(4, Math.min(window.innerWidth - row.offsetWidth - 4, e.clientX - dx)) + 'px';
             row.style.top  = Math.max(4, Math.min(window.innerHeight - row.offsetHeight - 4, e.clientY - dy)) + 'px';
-        });
-        const up = (e) => { if (e) e.stopPropagation(); drag = false; };
+        };
+        const up = (e) => { if (!drag) return; if (e) e.stopPropagation(); drag = false;
+            try { h.releasePointerCapture(pid); } catch (er) {} pid = null; };
+        h.addEventListener('pointerdown', start, { passive: false });
+        h.addEventListener('pointermove', move, { passive: false });
         h.addEventListener('pointerup', up);
         h.addEventListener('pointercancel', up);
-        h.addEventListener('pointerleave', up);
+        /* ★ 关键：去掉了 pointerleave 结束拖动 —— 以前手指一滑出那个小手柄(⠿)就断开，
+           表现就是「要按很久、老是拖不动」。现在用指针捕获，按住手柄就能顺滑拖到任何位置。 */
     })();
 
     /* ★关键：这些浮层上的手势不再传给 AR 场景，通话中随便点也不会误画线 */
@@ -10710,6 +10724,8 @@ function ensureVCUI() {
 
     document.getElementById('vc-cfg').onclick = () => document.getElementById('vc-set').classList.toggle('on');
     document.getElementById('vc-subbtn').onclick = () => { VC.set.sub = !VC.set.sub; swTxt(swS, VC.set.sub); vcSave(); vcRenderRows(); };
+    /* ★ 独立的文字输入框开关：点一下显示/隐藏，和设置菜单开关、清屏眼睛互不影响；设置里的开关也会同步 */
+    document.getElementById('vc-txtbtn').onclick = () => { VC.set.txt = !VC.set.txt; swTxt(swT, VC.set.txt); vcSave(); vcRenderRows(); };
     document.getElementById('vc-cut').onclick = () => { ttsStop(); vcSub(''); vcStatus(recOn ? '● 聆听中' : '‖ 已暂停'); };
     (function bindMic() {
         const mb = document.getElementById('vc-mic');
