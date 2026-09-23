@@ -3759,11 +3759,20 @@ async function initAR() {
     scene.add(shadowCatcherPlane);
 
     reticleMarker = new THREE.Object3D(); scene.add(reticleMarker);
-    initPavingStyles();
-    document.getElementById('start-btn').onclick = async () => {
+ document.getElementById('start-btn').onclick = async () => {
         if (resumeMode) { resumeAR(); return; }
+        /* ★ 语音识别关键修复：进入 AR 前先在用户手势里"预取"麦克风授权（不阻塞 AR 启动）。
+           很多手机/套壳App在 AR 沉浸态里再申请麦克风弹不出授权框 → 语音永远识别不到、被迫打字。
+           一旦这里授权通过并被系统记住，之后点人物时 vadStart 就能顺利拿到麦克风。 */
         try {
-            if (!navigator.xr) throw new Error("WebXR not supported");
+            if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia)
+                navigator.mediaDevices.getUserMedia({ audio: true })
+                    .then(s => { try { s.getTracks().forEach(t => t.stop()); } catch (e) {} })
+                    .catch(() => {});
+        } catch (e) {}
+        try {
+            if (!navigator.xr) throw new Error("WebXR not supported");   initPavingStyles();
+    
             const session = await createARSession();
             try { 
                 await renderer.xr.setReferenceSpaceType('local-floor'); 
@@ -3802,6 +3811,13 @@ async function initAR() {
     document.getElementById('accept-edict-btn').onclick = () => {
         document.getElementById('edict-overlay').style.display = 'none';
         document.getElementById('reticle').style.display = 'block';
+        /* ★ 再补一次麦克风授权：万一进入前那次没弹框，这里借"小民接旨"这个手势再试一次 */
+        try {
+            if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia)
+                navigator.mediaDevices.getUserMedia({ audio: true })
+                    .then(s => { try { s.getTracks().forEach(t => t.stop()); } catch (e) {} })
+                    .catch(() => {});
+        } catch (e) {}
         setTimeout(() => showSysToast('👈 点左上角 🧰 展开工具箱'), 600);
     };
     window.__ARHJ_READY = 1;   /* ★ 告诉启动自检：主脚本已经正常跑起来了 */
@@ -7984,10 +8000,27 @@ const SF_VOICE_STYLE = {
              + '气息匀稳、尾音轻轻放下；不要清亮尖细的少女音，不要活泼跳跃' },
     guanyin: { base: 'bella',  spd: 0.84,
         style: '用观世音菩萨的声线说话：音色低沉柔和、慈悲庄严，语速极缓、气息绵长匀稳，'
-             + '每字温厚落地，不急不躁、不轻不飘，绝无少女感' }
+             + '每字温厚落地，不急不躁、不轻不飘，绝无少女感' },
+    /* ===== 2026.10.22 新增：经典古装老电影柔美女声（官方女声底 + 古风柔美语气微调）===== */
+    yunny:   { base: 'claire', spd: 0.88,
+        style: '用经典古装电影里温柔女主角的声线说话：音色清丽柔美、婉转含情，气息轻缓绵柔，'
+             + '语速舒缓、语调温润，句尾轻轻收住，像老电影里知书达理的大家闺秀在轻声诉说；不要尖细、不要急促' },
+    wenrou:  { base: 'diana',  spd: 0.90,
+        style: '用一位娴静柔美的古典淑女声线说话：嗓音甜润柔和、温婉动听，气息匀稳绵长，'
+             + '语速从容、语调平缓亲切，尾音自然放轻，如春风拂面般让人安心；不要嗲、不要浮夸' },
+    guifei:  { base: 'bella',  spd: 0.86,
+        style: '用古装宫廷贵妃的声线说话：音色雍容华美、端庄柔和，气息沉稳，语速缓慢从容，'
+             + '语调温润典雅、字字圆润，透着大气与温柔，绝无少女尖音' },
+    xianzi:  { base: 'anna',   spd: 0.92,
+        style: '用古装仙侠剧中温柔仙子的声线说话：音色空灵柔美、清澈温润，气息轻柔绵长，'
+             + '语速平缓、语调柔和飘逸，尾音轻放，像不食人间烟火的仙子在低声细语；不要尖细刺耳' }
 };
 const SF_VOICES = [
     { id: 'guixiu',   name: '📜 书香女子 成熟温柔·舒缓（古风·推荐）' },
+    { id: 'yunny',    name: '🌷 古装女主 清丽柔美·婉转（古风·老电影）' },
+    { id: 'wenrou',   name: '🌸 古典淑女 甜润温婉·亲切（古风·柔美）' },
+    { id: 'guifei',   name: '👑 宫廷贵妃 雍容端庄·温润（古风）' },
+    { id: 'xianzi',   name: '🧚 温柔仙子 空灵柔美·飘逸（古风）' },
     { id: 'guzheng',  name: '🎼 抚筝女子 温润娴静·舒缓（古风）' },
     { id: 'guanyin',  name: '🧘 观音 低沉柔和·慈悲庄严' },
     { id: 'bella',    name: '🌸 Bella 温柔女声（现代）' },
@@ -8001,11 +8034,11 @@ const SF_VOICES = [
 ];
 /* ★ 角色 → 专属声线（⚙ 里可关掉"按角色自动配音"改为手动） */
 const CHAR_VOICE = {
-    '贵夫人·视频': 'guixiu',
+    '贵夫人·视频': 'guifei',
     '观音': 'guanyin',
-    '唐代美人': 'guixiu',
-    '古装美人': 'guixiu',
-    '唐代女': 'guixiu',
+    '唐代美人': 'yunny',
+    '古装美人': 'yunny',
+    '唐代女': 'wenrou',
     '古筝女': 'guzheng'
 };
 function charVoiceId(name) { return CHAR_VOICE[name] || ''; }
@@ -8667,7 +8700,15 @@ if (VC.set._v !== 9) {                       // 只纠正一次
     VC.set.sens = 0.0050;                    // ★2026.10.20 再调灵敏：小声也能识别
 }
 /* ★ 2026.9.16：单独把麦克风灵敏度再下调一档（只强制一次，绝不动语速/音色/其它任何设置） */
-if (VC.set._micv !== 2) { VC.set._micv = 2; VC.set.sens = 0.0030; }
+/* ★ 2026.10.22 语音识别专项：更灵敏门限 + 放大音量 + 云端识别/云端情感语音（只强制一次刷新） */
+if (VC.set._micv !== 3) {
+    VC.set._micv = 3;
+    VC.set.sens = 0.0016;                          // 更灵敏：大声小声都收得到
+    VC.set.asr  = 'cloud';                         // 云端识别（套壳App里浏览器识别不可靠，强制走云端）
+    VC.set.tts  = 'cloud';                         // 云端情感语音（更像真人、可调音量）
+    if (!(VC.set.vol >= 2.0)) VC.set.vol = 2.2;    // 语音更大声
+    if (!SF_VOICE_STYLE[VC.set.sfVoice] && !/^(anna|bella|diana|claire|alex|charles|benjamin|david)$/.test(VC.set.sfVoice || '')) VC.set.sfVoice = 'guixiu';
+}
 if (String(VC.set.model || '').indexOf('agnes') === 0 ||
     AGNES_MODELS.findIndex(m => m.id === VC.set.model) < 0) VC.set.model = AGNES_MODELS[0].id;
 vcSave();
@@ -8969,22 +9010,22 @@ function useCloudASR() {
 
 /* ---------- 麦克风闸门参数（可在设置面板里滑动条现场调灵敏度） ---------- */
 const MIC = {
-    absOn:     0.0028,  // ★2026.9.16 更灵敏：手机麦克风偏小声也稳稳收得到
-    onMul:     1.35,    // 起始门限 = 底噪 × 1.35（更容易触发）
-    offMul:    1.05,    // 结束门限 = 底噪 × 1.05
-    bargeMul:  2.40,    // 她说话时打断的门限倍数（你一开口更容易打断她）
-    startMs:   55,      // 0.055 秒有人声就开始收（更跟手）
-    endMs:     650,     // 停 0.65 秒才算你说完（半句话不会被切断）
-    minVoiceMs:55,      // 一段里有 0.055 秒人声就算有效
-    softMul:   0.45,    // 轻声门限 = 起始门限 × 0.45（更能收轻声）
-    softMs:    240,     // 轻声累计够 0.24 秒也照样送识别
+    absOn:     0.0016,  // ★2026.10.22 更灵敏：更小声也能稳稳收到
+    onMul:     1.22,    // 起始门限 = 底噪 × 1.22（更容易触发）
+    offMul:    1.02,    // 结束门限 = 底噪 × 1.02
+    bargeMul:  2.10,    // 她说话时打断的门限倍数（你一开口更容易打断她）
+    startMs:   45,      // 0.045 秒有人声就开始收（更跟手）
+    endMs:     800,     // 停 0.8 秒才算你说完（自然停顿不会被切断半句）
+    minVoiceMs:45,      // 一段里有 0.045 秒人声就算有效
+    softMul:   0.40,    // 轻声门限 = 起始门限 × 0.40（更能收轻声）
+    softMs:    200,     // 轻声累计够 0.20 秒也照样送识别
     peakMul:   0,       // 峰值闸门取消
-    tailMs:    480,     // 她说完后的回声静默期
-    bargeMs:   170,     // 0.17 秒就能把她的话打断
-    maxSegMs:  12000,   // 一直说不停 → 每 12 秒自动切一段送识别
+    tailMs:    420,     // 她说完后的回声静默期
+    bargeMs:   150,     // 0.15 秒就能把她的话打断
+    maxSegMs:  13000,   // 一直说不停 → 每 13 秒自动切一段送识别
     idleMs:    9000     // 一直没人声 → 每 9 秒换一段新缓冲
 };
-function micSens() { return Math.max(0.0025, Math.min(0.120, VC.set.sens || MIC.absOn)); }
+function micSens() { return Math.max(0.0012, Math.min(0.120, VC.set.sens || MIC.absOn)); }
 const PTT = { hold: false };
 function pttDown() {
     PTT.hold = true;
@@ -9081,8 +9122,8 @@ function vadTick(rms, pk, dt) {
     if (pk > VAD.peak) VAD.peak = pk;
     const T = Date.now();
     const talking = ttsSpeaking || (T < SPEAK_END_TS + MIC.tailMs);
-    if (!VAD.speaking && !talking && det < VAD.floor * 2.5) VAD.floor = VAD.floor * 0.99 + det * 0.01;
-    VAD.floor = Math.max(0.0008, Math.min(0.0500, VAD.floor));
+    if (!VAD.speaking && !talking && det < VAD.floor * 2.5) VAD.floor = VAD.floor * 0.995 + det * 0.005;
+    VAD.floor = Math.max(0.0008, Math.min(0.0180, VAD.floor));   // ★上限压到0.018，门限再也不会爬到把说话声挡掉
     const sens = micSens();
     const thOn   = talking ? Math.max(sens * 2.2, VAD.floor * MIC.bargeMul) : Math.max(sens, VAD.floor * MIC.onMul);
     const thOff  = talking ? thOn * 0.55 : Math.max(sens * 0.45, VAD.floor * MIC.offMul);
@@ -9308,8 +9349,8 @@ async function sfASRSend(a, b, vms, sms, ovl, brg) {
     let rpk = 0, rsum = 0;
     for (let i = 0; i < raw.length; i++) { const v = raw[i] < 0 ? -raw[i] : raw[i]; if (v > rpk) rpk = v; rsum += v; }
     const ravg = rsum / raw.length;
-    if (rpk < 0.004 && ravg < 0.0011) { vcStatus('● 聆听中'); return; }   // 只丢真正的纯静音
-    if (!VC.set.ptt && !(vms >= MIC.minVoiceMs || sms >= MIC.softMs || rpk > 0.012 || ravg > 0.0022)) { vcStatus('● 聆听中'); return; }
+    if (rpk < 0.0022 && ravg < 0.0006) { vcStatus('● 聆听中'); return; }   // 只丢真正的纯静音
+    if (!VC.set.ptt && !(vms >= MIC.minVoiceMs || sms >= MIC.softMs || rpk > 0.006 || ravg > 0.0012)) { vcStatus('● 聆听中'); return; }
     const blob = wavBlob(pcmTo16k(raw, PCM.sr));
     REC.busy = true; vcStatus('○ 识别中…');
     const ctl = new AbortController();
@@ -9405,10 +9446,10 @@ function onUserVoiceStart() {
 function onUserVoiceEnd() {
     if (!useCloudASR() || VC.set.ptt) return;
     clearTimeout(REC.cutTimer);
-    REC.cutTimer = setTimeout(() => {
-        if (VAD.speaking || !REC.on) return;
-        recCut(true);   /* ★VAD 已确认这段有真人声 → 一律送识别，交给云端+文本过滤把关 */
-    }, 180);
+    /* ★2026 修复：进入 AR 后 setTimeout 会被浏览器节流甚至暂停，原来靠 180ms 定时器切段
+       → 说完的话迟迟送不出去，表现就是"说了半天她没反应"。
+       现在直接在音频回调线程(vadTick)确认静音后立刻切段送识别，AR 内外都稳。 */
+    if (REC.on) recCut(true);
 }
 function recKick() {
     if (!recOn || !SR_CLS || recActive || !recObj) return;
@@ -9683,6 +9724,7 @@ function visionXRFrame(frame) {
             rc.putImageData(im, 0, 0);
             const fc = visFlipCv(tw, th);                        /* 一次性翻正 */
             fc.save(); fc.scale(1, -1); fc.drawImage(VIS.raw, 0, -th); fc.restore();
+            try { visDrawVirtual(fc, v, tw, th); } catch (e2) {}  /* ★ 把AR虚拟造景按当前视角叠到实景上 → AI看到的就是你屏幕真实画面 */
             const okq = visShotsFrom(VIS.flip, tw, th);
             if (!okq && (VIS.retry = (VIS.retry || 0) + 1) <= 2) return;   /* 废帧 → 下一帧再抓 */
             VIS.retry = 0;
@@ -9692,6 +9734,66 @@ function visionXRFrame(frame) {
     } catch (e) { VIS.mode = 'canvas'; VIS.want = false; }
     finally { try { if (changed) gl.bindFramebuffer(gl.FRAMEBUFFER, prevFb); } catch (e) {} }
 }
+/* ★ 2026.10 新增：按当前 XR 视角把「虚拟造景」单独渲染出来，叠加到实景相机画面上。
+   这样发给 AI 的图片 = 你手机屏幕上真正看到的「实景 + 假山/水池/花草/亭子」叠加画面，
+   她才能指着画面告诉你"在这里叠假山、先用几号石头、往哪个方向叠"。
+   只在需要抓图时执行（不是每帧），并严格保存/还原渲染状态，绝不影响主渲染，不产生残影。 */
+function visVRawCv(w, h) {
+    if (!VIS.vRaw) { VIS.vRaw = document.createElement('canvas'); VIS.vRawCtx = VIS.vRaw.getContext('2d'); }
+    if (VIS.vRaw.width !== w || VIS.vRaw.height !== h) { VIS.vRaw.width = w; VIS.vRaw.height = h; }
+    return VIS.vRawCtx;
+}
+function visDrawVirtual(ctx, view, tw, th) {
+    if (!renderer || !scene || !view || !view.transform) return;
+    /* 用当前 XR 视角搭一台一次性相机（矩阵全手动，不让 three 覆盖） */
+    if (!VIS.vcam) VIS.vcam = new THREE.PerspectiveCamera();
+    const cam = VIS.vcam;
+    cam.matrixAutoUpdate = false;
+    cam.matrixWorldAutoUpdate = false;
+    cam.projectionMatrix.fromArray(view.projectionMatrix);
+    if (cam.projectionMatrixInverse) cam.projectionMatrixInverse.copy(cam.projectionMatrix).invert();
+    cam.matrixWorld.fromArray(view.transform.matrix);
+    if (view.transform.inverse) cam.matrixWorldInverse.fromArray(view.transform.inverse.matrix);
+    else cam.matrixWorldInverse.copy(cam.matrixWorld).invert();
+    /* 离屏画布：把虚拟造景画进去（背景透明） */
+    if (!VIS.rtV || VIS.rtV.width !== tw || VIS.rtV.height !== th) {
+        try { if (VIS.rtV) VIS.rtV.dispose(); } catch (e) {}
+        VIS.rtV = new THREE.WebGLRenderTarget(tw, th,
+            { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, format: THREE.RGBAFormat });
+    }
+    const prevRT   = renderer.getRenderTarget();
+    const prevXr   = renderer.xr.enabled;
+    const prevAuto = renderer.autoClear;
+    const prevCC   = new THREE.Color();
+    renderer.getClearColor(prevCC);
+    const prevCA   = renderer.getClearAlpha();
+    const retV = reticleMarker ? reticleMarker.visible : false;
+    if (reticleMarker) reticleMarker.visible = false;   /* 准星不入镜 */
+    try {
+        renderer.xr.enabled = false;                    /* 临时脱离 XR，渲到我们自己的目标 */
+        renderer.autoClear = true;
+        renderer.setRenderTarget(VIS.rtV);
+        renderer.setClearColor(0x000000, 0);            /* 透明背景：只留虚拟物 */
+        renderer.clear(true, true, true);
+        renderer.render(scene, cam);
+        const need = tw * th * 4;
+        if (!VIS.vbuf || VIS.vbuf.length < need) VIS.vbuf = new Uint8Array(need);
+        renderer.readRenderTargetPixels(VIS.rtV, 0, 0, tw, th, VIS.vbuf);
+        const rc = visVRawCv(tw, th);
+        const im = rc.createImageData(tw, th);
+        im.data.set(VIS.vbuf.subarray(0, need));
+        rc.putImageData(im, 0, 0);
+        ctx.save(); ctx.scale(1, -1); ctx.drawImage(VIS.vRaw, 0, -th); ctx.restore();   /* GL上下颠倒→翻正后按透明度叠到实景上 */
+    } catch (e) {
+    } finally {                                         /* ★ 无论如何都完整还原，绝不影响主渲染 */
+        renderer.setRenderTarget(prevRT);
+        renderer.xr.enabled = prevXr;
+        renderer.autoClear = prevAuto;
+        try { renderer.setClearColor(prevCC, prevCA); } catch (e2) {}
+        if (reticleMarker) reticleMarker.visible = retV;
+    }
+}
+
 /* ④ 兜底：抓幻境画布（必须紧跟 render 之后抓，才不是空白） */
 function visGrabCanvas() {
     if (POINTER_DOWN) return;
@@ -9746,7 +9848,12 @@ window.visAsk = async function (q) {          // 单独测视觉问答
 };
 async function visStart() {
     if (VIS.on) return true;
-    VIS.mode = ''; VIS.err = 0; VIS.retry = 0;
+    VIS.mode = ''; VIS.err = 0; VIS.retry = 0; VIS.screen = false;
+    /* ★★ 2026.10 核心修复：AR 沉浸态下，屏幕共享(getDisplayMedia)截不到 AR 合成画面，
+       往往只得到黑屏或纯 UI。所以在 AR 里【优先】用「相机原始实景 + 我们按当前视角自绘的虚拟造景」
+       两层合成 → 发给 AI 的就是你手机屏幕上真正看到的「实景 + 假山/水池/花草」叠加画面，
+       她才能指着画面教你在哪叠、先用几号石头、怎么叠。
+       只有拿不到 AR 相机时，才退回 屏幕共享 / 后置摄像头 / 幻境画布，保证功能不中断。 */
     let xrNoCam = false;
     if (renderer && renderer.xr && renderer.xr.isPresenting) {
         let can = true;
@@ -9755,44 +9862,59 @@ async function visStart() {
             if (s && s.enabledFeatures && s.enabledFeatures.length)
                 can = (s.enabledFeatures.indexOf('camera-access') >= 0);
         } catch (e) {}
-        if (can && window.XRWebGLBinding) VIS.mode = 'xrcam';
-        else xrNoCam = true;                       // AR 中但没有原始相机权限 → 先试普通摄像头
+        if (can && window.XRWebGLBinding) VIS.mode = 'xrcam';   // ★ 实景 + 虚拟造景 合成
+        else xrNoCam = true;
     }
     if (!VIS.mode) {
-        try {
-            VIS.stream = await navigator.mediaDevices.getUserMedia({
-                video: { facingMode: { ideal: 'environment' },
-                         width: { ideal: 1920 }, height: { ideal: 1080 },
-                         frameRate: { ideal: 24, max: 30 } },
-                audio: false });
-            VIS.mode = 'video';
-        } catch (e) {
+        let denied = false;
+        if (navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia) {
             try {
                 VIS.stream = await navigator.mediaDevices.getDisplayMedia({
-                    video: { width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false });
+                    video: { frameRate: { ideal: 24, max: 30 },
+                             width: { ideal: 1920 }, height: { ideal: 1080 } },
+                    audio: false
+                });
+                VIS.mode = 'video'; VIS.screen = true;
+            } catch (e) { denied = true; }   // 用户拒绝 或 系统不支持屏幕捕获
+        } else denied = true;
+        if (!VIS.mode) {
+            try {
+                VIS.stream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: { ideal: 'environment' },
+                             width: { ideal: 1920 }, height: { ideal: 1080 },
+                             frameRate: { ideal: 24, max: 30 } },
+                    audio: false });
                 VIS.mode = 'video';
-            } catch (e2) { VIS.mode = 'canvas'; }
+            } catch (e) { VIS.mode = 'canvas'; }
         }
-        if (VIS.mode === 'video') {
-            VIS.video = document.createElement('video');
-            VIS.video.muted = true; VIS.video.playsInline = true;
-            VIS.video.setAttribute('playsinline', ''); VIS.video.style.display = 'none';
-            document.body.appendChild(VIS.video);
-            VIS.video.srcObject = VIS.stream;
-            try { await VIS.video.play(); } catch (e) {}
-        }
+        if (denied && VIS.mode !== 'video') showSysToast('⚠ 屏幕共享被拒绝，改用现有画面');
     }
+
+    if (VIS.mode === 'video') {
+        try {   // 用户在系统悬浮条上手动「停止共享」→ 自动收尾，避免残留黑帧
+            const tk = VIS.stream && VIS.stream.getVideoTracks && VIS.stream.getVideoTracks()[0];
+            if (tk) tk.onended = () => { try { visStop(); } catch (e) {} };
+        } catch (e) {}
+        VIS.video = document.createElement('video');
+        VIS.video.muted = true; VIS.video.playsInline = true;
+        VIS.video.setAttribute('playsinline', ''); VIS.video.style.display = 'none';
+        document.body.appendChild(VIS.video);
+        VIS.video.srcObject = VIS.stream;
+        try { await VIS.video.play(); } catch (e) {}
+    }
+
     VIS.on = true;
     clearInterval(VIS.timer);
     VIS.timer = setInterval(visRemember, 15000);
     setTimeout(visRemember, 1200);
     vcCamUI();
-    const nm = (VIS.mode === 'xrcam') ? '手机后置摄像头（真实世界）'
-             : (VIS.mode === 'video') ? '摄像头/屏幕画面' : '幻境画面';
+    const nm = VIS.screen ? '手机整屏画面（现实环境 + AR造景）'
+             : (VIS.mode === 'xrcam') ? '手机实时画面（实景 + 虚拟造景叠加）'
+             : (VIS.mode === 'video') ? '摄像头画面' : '幻境画面';
     vcStatus('📷 已共享：' + nm);
     if (VIS.mode === 'canvas')
-        showSysToast(xrNoCam ? '⚠ 当前内核未授予 camera-access，她只能看到幻境画面，看不到现实'
-                             : '⚠ 未取得摄像头，她只能看到屏幕上的幻境画面');
+        showSysToast(xrNoCam ? '⚠ 未取得屏幕/相机，她只能看到幻境画面'
+                             : '⚠ 未取得屏幕/相机，她只能看到屏幕上的幻境画面');
     else showSysToast('👀 她已能看清画面：' + nm);
     return true;
 }
@@ -9803,6 +9925,7 @@ function visStop() {
     try { if (VIS.video && VIS.video.parentNode) VIS.video.parentNode.removeChild(VIS.video); } catch (e) {}
     VIS.stream = null; VIS.video = null; VIS.binding = null;
     VIS.fbo = null; VIS.fbo2 = null; VIS.tex2 = null; VIS.tw = 0; VIS.th = 0; VIS.retry = 0;
+    try { if (VIS.rtV) { VIS.rtV.dispose(); VIS.rtV = null; } } catch (e) {}
     vcCamUI(); vcStatus('📵 已停止共享画面');
 }
 function visImgParts(shots, one) {
@@ -10026,7 +10149,7 @@ const STEP_HINT = [
     '· 位置优先用"以刚放好的那块为基准"的说法，例如"叠在假山石1的右上方，比它高5厘米，往左偏2厘米"。',
     '· 用户报完一步进度，就顺势给下一块，可用一句话点评（如"这块压得好，山势就出来了"）。',
     '· 用户跳步、改主意、想换石头，一律听他的，不要坚持自己的顺序。',
-    '· 【场地实况】里的数据就是你此刻"看到"的幻境画面（AR 虚拟模型不会出现在摄像头照片里），谈已摆好的东西一律以这份数据为准，不要说"画面里没有"。',
+    '· 【场地实况】里的数据是你此刻场景的精确数据；若本轮同时附了实时画面，画面里也能看到这些虚拟造景。谈已摆好的东西一律以这份数据为最准，不要说"画面里没有"。',
     '· 他不问就安静，绝不主动催他、绝不主动播报进度。'
 ].join('\n');
 /* ★内置「景观风水 + 工程尺寸」知识库：用户问造景/布局时自动喂给AI，配合实时朝向/坐标使用 */
@@ -10254,7 +10377,7 @@ function chatSysPrompt(name, seeMode) {
         '【最关键规矩】除了第一次出场时的那一句自我介绍，之后任何时候都禁止再自我介绍、禁止重复身份、禁止描述自己的性格或人设标签（例如不要说"我温柔体贴""我端庄贤淑"这类话）。用户问什么就直接答什么，简洁作答，答完即止。'
     ];
     if (seeMode) {
-        const src = (seeMode === 'xrcam') ? '手机后置摄像头此刻拍到的真实世界画面'
+        const src = (seeMode === 'xrcam') ? '用户手机屏幕上此刻真正看到的实时画面：真实环境 + 叠加在上面的AR虚拟造景（假山、水池、花草、亭子等），二者已合成在同一张图里'
                   : (seeMode === 'video') ? '用户共享给你的摄像头/屏幕实时画面'
                   : '用户设备屏幕上此刻显示的画面（含幻境里的虚拟造景）';
         arr.push(
@@ -10262,6 +10385,8 @@ function chatSysPrompt(name, seeMode) {
             '【看图铁律】① 只讲图里真实存在的东西，绝不猜、绝不编、绝不套模板；② 数量一个一个数清，实在数不准就说大概几个；③ 颜色说具体（米白、浅灰、深蓝、酒红这种），有花纹、品牌、型号、文字就念出来；④ 位置用口语说你左手边、正中间、右下角、桌子上；⑤ 真看不清就直说这块有点糊，请手机再靠近些或光线亮些；⑥ 用户只问某一样东西，就只答那一样，别把满屋子东西全报一遍；⑦ 用户没问画面，就一个字都不要描述画面。',
             '【看现场给布置建议】只有当用户拿摄像头扫现场并问"这里怎么布置/怎么设计/放什么好/合不合风水"时才展开：先一句话说清你看到的场地（大小感觉、地面、光照、已有的墙门树家具），再按"入口—主景—配景—地被"给 3~5 条能立刻照做的建议，每条写清放在画面的左/中/右、大约几米、用什么植物或材料、推荐间距，必要时顺口说一句在本软件里怎么点（路径绘制画铺装或池塘、组合种植撒花草、画池放树池）。全程不要提水深与施工做法。'
         );
+        if (seeMode === 'xrcam')
+            arr.push('【实景+虚拟造景·分步指导】图片里已经同时包含真实环境和你帮用户摆好的虚拟假山/水池/花草/亭子。请结合画面像站在现场一样指路：用"画面左边那块空地""水池右后方""你左手边墙角"等说法，明确告诉用户此处该在哪叠假山、先摆哪块石头（照抄清单里的名字与编号，如"假山石3"）、朝哪个方向叠、下一块压在上一块的什么位置、高低错落怎么处理，一步一步来；讲完一步就停，等他放好再讲下一步。');
     }
     arr.push(
         '【最重要的规矩·必须严格执行】',
@@ -10278,7 +10403,7 @@ function chatSysPrompt(name, seeMode) {
         '③ 每一步必须报全：选哪个模型（照抄系统给的清单原名，含编号，例如"假山石3"——云库图标上看不出编号，所以一定要报名字）、在哪个面板里选、放在什么位置（方位＋大约几米，或相对上一块石头的左/右/前/后）、离地高度多少厘米、旋转哪个轴多少度、左右前后偏移多少厘米，必要时说清开口或正面朝向。',
         '④ 讲位置优先用"以刚放好的那块为基准"，例如"叠在假山石1的右上方，比它高5厘米，往左偏2厘米"。',
         '⑤ 假山、凉亭、石桥、树木、花池、树池、铺装、水池、组合种植等全部造景元素都要能这样带着做；他跳步、改主意、要换石头，一律听他的。',
-        '⑥ 系统给的【场地实况】就是你此刻"看到"的幻境画面（AR虚拟模型不会出现在摄像头照片里），谈已摆好的东西一律以这份数据为准，不要说"画面里没有"。',
+        '⑥ 系统给的【场地实况】是你此刻场景的精确数据；若本轮附了实时画面，画面里同样能看到这些虚拟造景。谈已摆好的东西一律以这份数据为最准，不要说"画面里没有"。',
         '⑦ 分步指导时每步可用到约 110 字，其余闲聊照旧简短。',
         '【听不清怎么办】用户的话来自语音识别，可能有错别字或同音字，按上下文合理理解；实在听不懂就用一句话反问澄清，不要瞎猜乱答。',
         lenRule,
@@ -10464,6 +10589,7 @@ async function askAI(history, sysPrompt, onDelta, alive, imgs) {
     body.ui-hidden #vc-bar.on{display:flex !important;}
     body.ui-hidden #vc-fab.on{display:flex !important;}
     body.vcx #vc-bar,body.vcx #vc-bar.on,body.vcx #vc-set,body.vcx #vc-sub{display:none !important;}
+    body.vc-hidepanel #side-controls{display:none !important;}
     #vc-drag{flex:0 0 auto;width:22px;height:30px;display:flex;align-items:center;justify-content:center;
         color:#5fd3b4;font-size:16px;cursor:move;touch-action:none;-webkit-user-select:none;user-select:none;}`;
     document.head.appendChild(css);
@@ -10515,6 +10641,8 @@ function vcRenderRows() {
     if (sb) sb.classList.toggle('on', VC.set.sub);
     const tb = document.getElementById('vc-txtbtn');
     if (tb) tb.classList.toggle('on', VC.set.txt);
+    const pb = document.getElementById('vc-panel');
+    if (pb) pb.classList.toggle('on', !document.body.classList.contains('vc-hidepanel'));
     vcCamUI();
 }
 
@@ -10536,6 +10664,7 @@ function ensureVCUI() {
         '<button class="vc-b" id="vc-subbtn" title="字幕开关">💬</button>' +
         '<button class="vc-b" id="vc-txtbtn" title="文字输入框开关（清屏后也能用·独立开关）">⌨</button>' +
         '<button class="vc-b" id="vc-cam" title="共享摄像头/屏幕画面给她看">📵</button>' +
+        '<button class="vc-b" id="vc-panel" title="显示/隐藏右侧高度角度等操作键">🎛</button>' +
         '<button class="vc-b" id="vc-hide" title="只隐藏通话条">🙈</button>' +
         '<button class="vc-b" id="vc-cfg" title="设置">⚙</button>' +
         '<button class="vc-b hang" id="vc-hang" title="挂断">📞</button>';
@@ -10747,6 +10876,13 @@ function ensureVCUI() {
     })();
     document.getElementById('vc-hang').onclick = () => closeChatPanel();
     document.getElementById('vc-hide').onclick = (e) => { e.stopPropagation(); vcBarHide(true); };
+    document.getElementById('vc-panel').onclick = (e) => {
+        e.stopPropagation();
+        const hidden = document.body.classList.toggle('vc-hidepanel');
+        const pb = document.getElementById('vc-panel');
+        if (pb) pb.classList.toggle('on', !hidden);
+        showSysToast(hidden ? '已隐藏右侧操作键（需要时点🎛再打开）' : '已显示右侧操作键');
+    };
     const camGo = async () => {
         if (VIS.on) { visStop(); VC.set.share = false; }
         else { VC.set.share = true; await visStart(); }
@@ -10790,6 +10926,7 @@ function openChatPanel(obj) {          // 轻点任意一位人物 → 直接切
     TALK.rig = buildTalkRig(obj);
     VC.on = true;
     RT_TTS_LOCAL = false; RT_ASR_LOCAL = false;   // ★ 每次接通都重新优先用云端
+    document.body.classList.add('vc-hidepanel');   /* ★ 交流时默认收起右侧操作键，画面更干净；点🎛可随时打开 */
     document.getElementById('vc-bar').classList.add('on');
     document.getElementById('vc-who').innerText = chatLabel(obj);
     const _fab = document.getElementById('vc-fab');
@@ -10816,6 +10953,7 @@ function openChatPanel(obj) {          // 轻点任意一位人物 → 直接切
 }
 function closeChatPanel() {
     VC.on = false;
+    document.body.classList.remove('vc-hidepanel');   /* ★ 挂断后恢复右侧操作键 */
     recStop(); ttsStop(); talkStop(); musicStop(); vcSub('');
     visStop();
     const _f2 = document.getElementById('vc-fab');
