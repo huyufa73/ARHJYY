@@ -211,6 +211,16 @@
         .asset-panel { background:rgba(255,255,255,0.95); border-radius:16px 16px 0 0; }
         .asset-box { width:34px; height:34px; border-radius:10px; }
         .sub-btn { background:rgba(6,42,38,0.62); border:1px solid rgba(95,211,180,0.32); border-radius:10px; }
+
+        /* ===== 右侧调整键（旋转/高低/材质等）可暂时收起 ===== */
+        #sc-toggle { position:fixed; right:8px; top:104px; z-index:9998; width:42px; height:42px;
+            border-radius:50%; background:rgba(6,42,38,0.6); color:#fff;
+            border:2px solid rgba(95,211,180,0.85); font-size:18px; cursor:pointer;
+            display:flex; align-items:center; justify-content:center;
+            box-shadow:0 4px 10px rgba(0,0,0,0.5); pointer-events:auto; }
+        #sc-toggle.off { background:#c0392b; border-color:#f1c40f; }
+        body.sc-hidden #side-controls { display:none !important; }
+        body.ui-hidden #sc-toggle { display:none !important; }
     </style>
 </head>
 <body>
@@ -313,6 +323,7 @@
 <div id="sys-toast">材质已切换</div>
 <div id="loading-toast">正在极速加载模型...</div>
 <button id="btn-eye-toggle" title="隐藏界面录屏">👁</button>
+<button id="sc-toggle" title="收起/展开右侧调整键（旋转·高低·材质）">🎚</button>
 
 <div id="ui-layer">
     <div class="top-bar">
@@ -359,7 +370,7 @@
             <input type="range" id="scatter-size" min="0.3" max="2" step="0.05" value="1">
         </div>
         <button class="sp-btn" id="btn-scatter-apply" style="display:none;background:#f39c12;color:#3b2500;">🔄 应用到选中的组合</button>
-        <button class="sp-btn" id="btn-scatter-area">🖊 用画的区域生成</button>
+        <button class="sp-btn" id="btn-scatter-area">🖊 用画的线/区域生成</button>
         <button class="sp-btn alt" id="btn-scatter-pick">👉 点选已有面/水池</button>
         <button class="sp-btn" id="scatter-clear" style="background:#c0392b;color:#fff;">清空勾选</button>
     </div>
@@ -793,13 +804,29 @@ const VCHAR_REPO  = { user: 'huyufa73', repo: 'ARHJYY', dir: 'Videos' };
 const VCHAR_ALIAS = { 'Gui Fu Ren': '贵夫人' };
 const VCHAR_VEXT  = /\.(webm|mov|mp4|m4v)$/i;
 const VCHAR_SCAN  = { done: false, busy: false, found: 0, ts: 0 };
-const VCHAR_LS    = 'arhj_vchar_dir_v2';
+const VCHAR_LS    = 'arhj_vchar_dir_v3';
 
 function vcharKey(s) { return String(s || '').toLowerCase().replace(/[\s._\-]+/g, ''); }
 function vcharStem(path) {
     const p = String(path || '');
     const nm = p.slice(p.lastIndexOf('/') + 1);
     return nm.replace(VCHAR_VEXT, '').replace(/[-_ ]?alpha$/i, '').trim();
+}
+/* ★ 取"相对 Videos 的所在文件夹"（多片段人物用文件夹名当人物名） */
+function vcharFolderOf(path) {
+    const rel = String(path || '').replace(new RegExp('^' + VCHAR_REPO.dir + '/', 'i'), '');
+    const i = rel.lastIndexOf('/');
+    return i >= 0 ? rel.slice(0, i) : '';
+}
+/* ★ 从文件名识别动作状态：不说话/说话/跳舞/哭/笑（认不出返回空） */
+function vcharActOf(stem) {
+    const s = String(stem || '');
+    if (/(不说话|不說話|静立|靜立|待机|待機|站立|默认|默認|idle|stand|standby|silent|default)/i.test(s)) return 'idle';
+    if (/(跳舞|舞蹈|dance|dancing)/i.test(s)) return 'dance';
+    if (/(哭泣|流泪|流淚|哭|cry|crying)/i.test(s)) return 'cry';
+    if (/(微笑|笑容|大笑|笑|smile|laugh)/i.test(s)) return 'smile';
+    if (/(说话|說話|讲话|講話|谈话|談話|开口|開口|talk|speak|speaking|talking)/i.test(s)) return 'talk';
+    return '';
 }
 function vcharSafeId(stem) {
     let s = String(stem || '').replace(/[^0-9a-zA-Z\u4e00-\u9fa5]/g, '');
@@ -890,6 +917,16 @@ async function vcharListRepo() {
 function vcharAdopt(g) {
     if (!g || !g.id) return false;
     let a = CLOUD_MODELS.find(x => x.id === g.id);
+    /* ★ 2026 修复：同一位人物用不同命名(英文路径 vs 中文文件夹)时，按显示名归并，
+       避免云库「人物角色」里出现两个重复的贵夫人（自动发现的会并入内置那一位） */
+    if (!a && g.name) {
+        const _norm = s => vcharKey(String(s || '').replace(/[·.\s]*视频\s*$/, ''));
+        const _nk = _norm(g.name);
+        if (_nk) {
+            const _hit = CLOUD_MODELS.find(x => x.isVideo && _norm(x.name) === _nk);
+            if (_hit) { a = _hit; g.id = _hit.id; }
+        }
+    }
     const isNew = !a;
     if (isNew) {
         a = { id: g.id, cat: 'cat_renwu', name: g.name || g.id, icon: '🎬',
@@ -904,6 +941,12 @@ function vcharAdopt(g) {
     }
     a.isVideo = true; a.cat = 'cat_renwu';
     let chg = isNew;
+    if (g.multi && g.clips) {
+        a.isMultiClip = true;
+        const cj = JSON.stringify(g.clips);
+        if (a._clipsJSON !== cj) { a.clips = g.clips; a._clipsJSON = cj; delete VCHAR_CACHE[a.id]; chg = 1; }
+        return isNew;
+    }
     if (g.webm && a.file !== g.webm)     { a.file = g.webm;     chg = 1; }
     if (g.mov  && a.alt !== g.mov)       { a.alt = g.mov;       chg = 1; }
     if (g.mp4  && a.fallback !== g.mp4)  { a.fallback = g.mp4;  chg = 1; }
@@ -912,9 +955,11 @@ function vcharAdopt(g) {
 }
 function vcharSaveCache(list) {
     try {
-        localStorage.setItem(VCHAR_LS, JSON.stringify({ t: Date.now(), groups: list.map(g => ({
+        localStorage.setItem(VCHAR_LS, JSON.stringify({ t: Date.now(), groups: list.map(g => (g.multi ? ({
+            id: g.id, name: g.name, multi: 1, clips: g.clips || {}
+        }) : ({
             id: g.id, name: g.name, webm: g.webm || '', mov: g.mov || '', mp4: g.mp4 || ''
-        })) }));
+        }))) }));
     } catch (e) {}
 }
 function vcharLoadCache() {
@@ -934,26 +979,53 @@ async function vcharScan(silent) {
     try {
         const files = await vcharListRepo();
         if (files && files.length) {
-            const grp = {};
-            files.forEach(p => {
-                const stem = vcharStem(p);
-                if (!stem) return;
-                const k = vcharKey(stem);
-                if (!grp[k]) grp[k] = { stem: stem };
-                const g = grp[k];
-                if (/\.webm$/i.test(p))      { if (!g.webm) g.webm = p; }
-                else if (/\.mov$/i.test(p))  { if (!g.mov)  g.mov  = p; }
-                else if (!g.mp4)             { g.mp4 = p; }
-            });
+            /* ★ 2026 多片段人物：先按"所在文件夹"分组；文件夹里若出现
+               不说话/说话/跳舞/哭/笑 等动作片段 → 整个文件夹当作一位人物，
+               各视频=她的不同状态；否则沿用旧的"按文件名"单片段识别（贵夫人不受影响）。 */
+            const folders = {};
+            files.forEach(p => { const f = vcharFolderOf(p); (folders[f] = folders[f] || []).push(p); });
             const list = [], alive = {};
-            Object.keys(grp).forEach(k => {
-                const g = grp[k];
-                if (!g.webm && !g.mov && !g.mp4) return;
-                g.id = vcharSafeId(g.stem);
-                g.name = vcharNiceName(g.stem);
-                alive[g.id] = 1;
-                list.push(g);
-                if (vcharAdopt(g)) add++;
+            Object.keys(folders).forEach(folder => {
+                const fs = folders[folder];
+                let hasAct = false;
+                if (folder) fs.forEach(p => { if (vcharActOf(vcharStem(p))) hasAct = true; });
+                if (hasAct) {
+                    const stem = folder.slice(folder.lastIndexOf('/') + 1);
+                    const g = { multi: true, stem: stem, clips: {} };
+                    fs.forEach(p => {
+                        const act = vcharActOf(vcharStem(p)) || 'idle';
+                        const c = g.clips[act] = g.clips[act] || {};
+                        if (/\.webm$/i.test(p))      { if (!c.webm) c.webm = p; }
+                        else if (/\.mov$/i.test(p))  { if (!c.mov)  c.mov  = p; }
+                        else if (!c.mp4)             { c.mp4 = p; }
+                    });
+                    g.id = vcharSafeId(stem);
+                    g.name = vcharNiceName(stem);
+                    alive[g.id] = 1;
+                    list.push(g);
+                    if (vcharAdopt(g)) add++;
+                } else {
+                    const grp = {};
+                    fs.forEach(p => {
+                        const stem = vcharStem(p);
+                        if (!stem) return;
+                        const k = vcharKey(stem);
+                        if (!grp[k]) grp[k] = { stem: stem };
+                        const g = grp[k];
+                        if (/\.webm$/i.test(p))      { if (!g.webm) g.webm = p; }
+                        else if (/\.mov$/i.test(p))  { if (!g.mov)  g.mov  = p; }
+                        else if (!g.mp4)             { g.mp4 = p; }
+                    });
+                    Object.keys(grp).forEach(k => {
+                        const g = grp[k];
+                        if (!g.webm && !g.mov && !g.mp4) return;
+                        g.id = vcharSafeId(g.stem);
+                        g.name = vcharNiceName(g.stem);
+                        alive[g.id] = 1;
+                        list.push(g);
+                        if (vcharAdopt(g)) add++;
+                    });
+                }
             });
             /* 仓库里已删掉的自动人物同步下架（手写的贵夫人永不受影响） */
             for (let i = CLOUD_MODELS.length - 1; i >= 0; i--) {
@@ -1157,11 +1229,18 @@ function vcharMat(box) {
                     c = mix(c, cs, uUnpre);
                     a = clamp((a - uEdge) / max(0.0001, 1.0 - uEdge), 0.0, 1.0);  /* 收掉毛边 */
                 } else {
-                    /* 兜底：蓝幕/绿幕自动抠像（★人物内部一律拉满不透光，只留边缘柔和） */
+                    /* 兜底：蓝幕/绿幕自动抠像（★2026 尽量保住人物服饰：只有"确实是幕布纯色"才抠掉）*/
                     vec3 cn = c / max(0.02, max(c.r, max(c.g, c.b)));
                     float d = distance(cbcr(cn), uKeyCC);
                     a = smoothstep(uSim, uSim + max(uSmooth, 0.002), d);
                     a = clamp((a - 0.12) / 0.55, 0.0, 1.0);
+                    /* ★ 服饰保护：只有当幕布色通道明显压过另外两通道时才允许抠除，
+                       颜色鲜艳、偏蓝偏绿的衣服/头饰/披帛都会被保留下来 */
+                    float dom;
+                    if (uKey.b >= uKey.g) dom = c.b - max(c.r, c.g);   // 蓝幕
+                    else dom = c.g - max(c.r, c.b);                    // 绿幕
+                    float keepCloth = 1.0 - smoothstep(0.12, 0.32, dom);
+                    a = max(a, keepCloth);
                     if (uKey.b >= uKey.g) {
                         float sp = max(0.0, c.b - max(c.r, c.g));
                         c.b -= sp * uSpill;
@@ -1184,7 +1263,7 @@ function vcharMat(box) {
 /* ---------- ③ 自动识别幕布颜色（取画面四角，蓝幕/绿幕都认） ---------- */
 function vcharAutoKey(box) {
     try {
-        const v = box.video;
+        const v = vcActiveVideo(box);
         if (!v || !v.videoWidth) return;
         const W = 48, H = 48;
         if (!box.kcv) { box.kcv = document.createElement('canvas'); box.kctx = box.kcv.getContext('2d', { willReadFrequently: true }); }
@@ -1209,7 +1288,7 @@ function vcharAutoKey(box) {
 /* 返回 1=确定自带透明通道  0=确定没有(需抠像)  -1=读不出来(保持当前判断) */
 function vcharAlphaProbe(box) {
     try {
-        const v = box.video;
+        const v = vcActiveVideo(box);
         if (!v || !v.videoWidth || v.readyState < 2) return -1;
         const W = 44, H = 44, n = W * H;
         if (!box.acv) {
@@ -1235,7 +1314,7 @@ function vcharAlphaProbe(box) {
    预乘: 颜色值恒 ≤ alpha 值；直通: 亮部会明显亮过 alpha 值 */
 function vcharPremulProbe(box) {
     try {
-        const v = box.video;
+        const v = vcActiveVideo(box);
         if (!v || !v.videoWidth || v.readyState < 2) return !!box.preMul;
         const W = 96, H = 96;
         if (!box.pcv) {
@@ -1260,6 +1339,8 @@ function vcharPremulProbe(box) {
     } catch (e) { return !!box.preMul; }
 }
 function vcharGet(id, cb) {
+    const _mc = CLOUD_MODELS.find(a => a.id === id);
+    if (_mc && _mc.isMultiClip) { vcharGetMulti(id, cb); return; }
     const c = VCHAR_CACHE[id];
     if (c && c.ready) { cb(c); return; }
     if (c && c.waits) { c.waits.push(cb); return; }
@@ -1371,6 +1452,238 @@ function vcharGet(id, cb) {
 boot('fallback');
 }
 
+/* ==========================================================================
+   ★★★ 2026 新增：多片段视频人物（不说话/说话/跳舞/哭/笑 无缝自动切换）★★★
+   仓库放法：Videos/人名/不说话.mp4  Videos/人名/说话.mp4  Videos/人名/跳舞.mp4 …
+   · 放置后默认播"不说话"(安静静立)；你开口问她→自动切"说话"，说完自动回"不说话"
+   · 说"跳个舞"→切"跳舞"，说"别跳了"→回不说话；说"哭一个/笑一个"→短暂对应片段
+   · 优先级：说话 > 跳舞 > 哭/笑 > 不说话；备用片段平时暂停不解码，省性能
+   ========================================================================== */
+function vcActiveVideo(box) {
+    if (box && box.multi) { const c = box.clips && box.clips[box.cur]; return c && c.video; }
+    return box && box.video;
+}
+function vcStPri(s) { return s === 'talk' ? 4 : (s === 'dance' ? 3 : ((s === 'cry' || s === 'smile') ? 2 : 1)); }
+function vcMergeState(a, b) { if (!a) return b; return vcStPri(b) > vcStPri(a) ? b : a; }
+function vcClipCandidates(f) {
+    const out = [];
+    const push = s => { if (s && out.indexOf(s) < 0) out.push(s); };
+    const i = f.lastIndexOf('/');
+    const dir = f.slice(0, i + 1), nm = f.slice(i + 1);
+    const stem = nm.replace(/\.[^.]+$/, '');
+    const ext = (nm.match(/\.[^.]+$/) || ['.mp4'])[0];
+    const dirs = [dir, dir.replace(/ /g, '_'), dir.replace(/ /g, '')];
+    const stems = [stem, stem.replace(/ /g, '_'), stem.replace(/ /g, '')];
+    const exts = /webm$/i.test(ext) ? ['.webm', '.WEBM']
+               : (/mov$/i.test(ext) ? ['.mov', '.MOV'] : ['.mp4', '.MP4']);
+    dirs.forEach(d => stems.forEach(s => exts.forEach(e => push(d + s + e))));
+    return out;
+}
+async function vcClipURLResolve(clip) {
+    if (!clip) return null;
+    const order = [];
+    if (clip.webm && vcharCan('webm')) order.push({ f: clip.webm, alpha: true });
+    if (clip.mov && vcharCan('hevc'))  order.push({ f: clip.mov,  alpha: true });
+    if (clip.mp4)                      order.push({ f: clip.mp4,  alpha: false });
+    if (clip.mov && !order.some(o => o.f === clip.mov)) order.push({ f: clip.mov, alpha: true });
+    for (let k = 0; k < order.length; k++) {
+        const files = vcClipCandidates(order[k].f);
+        for (let b = 0; b < VCHAR_BASES.length; b++) {
+            const list = files.map(x => VCHAR_BASES[b] + encodeURI(x));
+            const hit = await vcharProbe(list, 8);
+            if (hit) return { url: hit, alpha: order[k].alpha };
+        }
+    }
+    return null;
+}
+function vcLoadClipVideo(url, onReady, onFail, keepAudio) {
+    const v = document.createElement('video');
+    v.crossOrigin = 'anonymous';
+    v.loop = true;
+    /* ★ 跳舞片段保留原声音乐（更有意境）；其余片段(不说话/说话/哭/笑)仍静音，绝不干扰语音 */
+    if (keepAudio) { v.muted = false; v.defaultMuted = false; v.volume = 1.0; }
+    else { v.muted = true; v.defaultMuted = true; v.volume = 0; }
+    v.playsInline = true; v.preload = 'auto';
+    v.setAttribute('playsinline', ''); v.setAttribute('webkit-playsinline', '');
+    if (!keepAudio) v.setAttribute('muted', '');
+    v.style.cssText = 'position:fixed;left:0;bottom:0;width:2px;height:2px;opacity:0.01;pointer-events:none;z-index:-1;';
+    document.body.appendChild(v);
+    let done = false;
+    const ok = () => { if (done || !v.videoWidth) return; done = true; onReady(v); };
+    v.addEventListener('loadeddata', ok);
+    v.addEventListener('canplay', ok);
+    v.addEventListener('error', () => { if (done) return; done = true; try { if (v.parentNode) v.parentNode.removeChild(v); } catch (e) {} if (onFail) onFail(); });
+    v.src = url;
+    try { const p = v.play(); if (p && p.catch) p.catch(() => {}); } catch (e) {}
+    setTimeout(() => { if (!done) { if (v.videoWidth) ok(); else { done = true; try { if (v.parentNode) v.parentNode.removeChild(v); } catch (e) {} if (onFail) onFail(); } } }, 8000);
+}
+function vcEnsureClip(box, asset, act) {
+    if (!asset || !asset.clips || !asset.clips[act]) return;
+    if (box.clips[act]) return;                 /* 已加载或加载中 */
+    box.clips[act] = { loading: true };
+    const _keepAudio = (act === 'dance');       /* ★ 跳舞片段带音乐 */
+    vcClipURLResolve(asset.clips[act]).then(res => {
+        if (!res) { delete box.clips[act]; return; }
+        vcLoadClipVideo(res.url, (v) => {
+            try { v.pause(); } catch (e) {}       /* 备用片段先暂停，切到才播 */
+            box.clips[act] = { video: v, url: res.url, ready: true, alpha: res.alpha, keepAudio: _keepAudio };
+        }, () => { delete box.clips[act]; }, _keepAudio);
+    });
+}
+function vcharGetMulti(id, cb) {
+    const c = VCHAR_CACHE[id];
+    if (c && c.ready) { cb(c); return; }
+    if (c && c.waits) { c.waits.push(cb); return; }
+    const asset = CLOUD_MODELS.find(a => a.id === id);
+    if (!asset || !asset.clips) {
+        if (!VCHAR_SCAN.done && !VCHAR_SCAN.busy)
+            vcharScan(true).then(() => { const a2 = CLOUD_MODELS.find(a => a.id === id); if (a2 && a2.isMultiClip) vcharGetMulti(id, cb); });
+        return;
+    }
+    const box = { multi: true, _id: id, _asset: asset, waits: [cb], ready: false,
+                  clips: {}, cur: '', hasAlpha: true, rate: 0, fresh: 0 };
+    VCHAR_CACHE[id] = box;
+    const toast = document.getElementById('loading-toast');
+    toast.style.maxWidth = ''; toast.style.whiteSpace = '';
+    toast.style.display = 'block';
+    toast.innerText = '正在载入人物：' + asset.name + '…';
+    const order = ['idle', 'talk', 'dance', 'smile', 'cry'];
+    const firstAct = order.find(a => asset.clips[a]) || Object.keys(asset.clips)[0];
+    const fail = (msg) => {
+        delete VCHAR_CACHE[id];
+        toast.style.maxWidth = '90vw'; toast.style.whiteSpace = 'pre-wrap';
+        toast.style.display = 'block';
+        toast.innerText = msg || '❌ 人物视频加载失败';
+        setTimeout(() => { toast.style.display = 'none'; }, 12000);
+    };
+    if (!firstAct) { fail('❌ 该人物文件夹里没有可用视频'); return; }
+    vcClipURLResolve(asset.clips[firstAct]).then(res => {
+        if (!res) { fail('❌ 找不到能播的视频：' + asset.name); return; }
+        vcLoadClipVideo(res.url, (v) => {
+            box.clips[firstAct] = { video: v, url: res.url, ready: true, alpha: res.alpha };
+            box.cur = firstAct;
+            box.aspect = v.videoWidth / v.videoHeight;
+            const vcv = document.createElement('canvas');
+            vcv.width = v.videoWidth || 640; vcv.height = v.videoHeight || 360;
+            box.drawCv = vcv; box.drawCtx = vcv.getContext('2d');
+            const tex = new THREE.CanvasTexture(vcv);
+            tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter;
+            tex.generateMipmaps = false;
+            tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+            tex.premultiplyAlpha = false; tex.needsUpdate = true;
+            box.tex = tex; box.fresh = 12;
+            box.hasAlpha = !!res.alpha;
+            const pr0 = vcharAlphaProbe(box);
+            if (pr0 === 1) box.hasAlpha = true; else if (pr0 === 0) box.hasAlpha = false;
+            box.ready = true;
+            toast.style.display = 'none';
+            const q = box.waits || []; box.waits = null;
+            q.forEach(f => { try { f(box); } catch (e) {} });
+            const recheck = () => {
+                const r = vcharAlphaProbe(box);
+                if (r === 1) box.hasAlpha = true; else if (r === 0) box.hasAlpha = false;
+                if (box.hasAlpha) vcharPremulProbe(box); else vcharAutoKey(box);
+                vcharApplyAll(false);
+            };
+            setTimeout(recheck, 420);
+            setTimeout(recheck, 1500);
+            /* 后台预载其余片段（"说话"最常用，排最前） */
+            const rest = Object.keys(asset.clips).filter(a => a !== firstAct)
+                .sort((a, b) => (a === 'talk' ? -1 : b === 'talk' ? 1 : 0));
+            let di = 0;
+            const preload = () => { if (di >= rest.length) return; vcEnsureClip(box, asset, rest[di++]); setTimeout(preload, 900); };
+            setTimeout(preload, 600);
+        }, () => { fail('❌ 视频加载失败：' + asset.name + '\n' + (res.url || '')); });
+    });
+}
+function updateMultiClip(box, want) {
+    if (!box || !box.ready) return;
+    const asset = box._asset;
+    let target = want || 'idle';
+    if (!box.clips[target]) { if (asset) vcEnsureClip(box, asset, target); }
+    if (!box.clips[target] || !box.clips[target].ready) {
+        target = (box.clips['idle'] && box.clips['idle'].ready) ? 'idle' : box.cur;
+    }
+    if (target && target !== box.cur && box.clips[target] && box.clips[target].ready) {
+        const oldc = box.clips[box.cur];
+        if (oldc && oldc.video) { try { oldc.video.pause(); } catch (e) {} }
+        box.cur = target;
+        box.fresh = 10;
+        const na = !!box.clips[target].alpha;
+        if (na !== box.hasAlpha) {
+            box.hasAlpha = na;
+            for (let i = 0; i < VCHAR_LIST.length; i++) {
+                const o = VCHAR_LIST[i];
+                if (o.userData.vcharId !== box._id) continue;
+                const mm = o.userData.vcMesh;
+                if (mm && mm.material && mm.material.uniforms && mm.material.uniforms.uAlpha)
+                    mm.material.uniforms.uAlpha.value = na ? 1.0 : 0.0;
+            }
+        }
+    }
+    const clip = box.clips[box.cur];
+    if (!clip || !clip.video) return;
+    const v = clip.video;
+    if (v.paused) { const p = v.play(); if (p && p.catch) p.catch(() => {}); }
+    try { v.playbackRate = 1.0; } catch (e) {}
+    if (box.tex && box.drawCtx) {
+        if (!v.paused && v.readyState >= 2) {
+            try { box.drawCtx.drawImage(v, 0, 0, box.drawCv.width, box.drawCv.height); box.tex.needsUpdate = true; } catch (e) {}
+        } else if (box.fresh > 0) {
+            box.fresh--;
+            try { box.drawCtx.drawImage(v, 0, 0, box.drawCv.width, box.drawCv.height); box.tex.needsUpdate = true; } catch (e) {}
+        }
+    }
+}
+/* 动作指令：跳舞/停/哭/笑（仅多片段人物有效，不匹配则交给 AI 正常对话）*/
+const RX_ACT_DANCE = /(跳舞|跳个舞|跳支舞|跳一支|来段舞|来个舞|舞一段|跳一下|dance)/i;
+const RX_ACT_DANCE_STOP = /(别跳|不跳|停下|停止|停一下|别舞|歇会|歇一会|够了|不用跳)/;
+const RX_ACT_CRY = /(哭一个|哭一下|哭一哭|哭吧|哭给我|装哭|cry)/i;
+const RX_ACT_SMILE = /(笑一个|笑一下|笑一笑|笑笑|微笑一下|smile)/i;
+function vcActionSpeak(line, emo) {
+    ttsBegin();
+    SF_EMO_NOW = (emo && SF_EMO[emo]) ? emo : '温柔';
+    if (chatTarget && chatTarget.userData && chatTarget.userData._chatLog)
+        chatTarget.userData._chatLog.push({ role: 'assistant', content: line });
+    ttsPush(line, true);
+}
+async function handleActionCommand(text) {
+    if (!chatTarget) return false;
+    const id = chatTarget.userData.id || chatTarget.userData.modelId;
+    const box = VCHAR_CACHE[id];
+    const asset = CLOUD_MODELS.find(a => a.id === id);
+    if (!box || !box.multi || !asset || !asset.clips) return false;
+    const t = String(text || '');
+    if (asset.clips.dance && RX_ACT_DANCE.test(t)) {
+        chatTarget.userData._vcDance = true; chatTarget.userData._vcAction = '';
+        vcActionSpeak('好呀，我为你跳一支舞。', '开心');
+        return true;
+    }
+    if (chatTarget.userData._vcDance && RX_ACT_DANCE_STOP.test(t)) {
+        chatTarget.userData._vcDance = false;
+        vcActionSpeak('好，我先停下啦。', '温柔');
+        return true;
+    }
+    if (asset.clips.cry && RX_ACT_CRY.test(t)) {
+        chatTarget.userData._vcDance = false;
+        chatTarget.userData._vcAction = 'cry';
+        clearTimeout(chatTarget.userData._vcActTimer);
+        chatTarget.userData._vcActTimer = setTimeout(() => { if (chatTarget) chatTarget.userData._vcAction = ''; }, 8000);
+        vcActionSpeak('呜…人家有点难过嘛。', '难过');
+        return true;
+    }
+    if (asset.clips.smile && RX_ACT_SMILE.test(t)) {
+        chatTarget.userData._vcDance = false;
+        chatTarget.userData._vcAction = 'smile';
+        clearTimeout(chatTarget.userData._vcActTimer);
+        chatTarget.userData._vcActTimer = setTimeout(() => { if (chatTarget) chatTarget.userData._vcAction = ''; }, 8000);
+        vcActionSpeak('嘻嘻，看我笑一个给你。', '开心');
+        return true;
+    }
+    return false;
+}
+/* ===================== 多片段视频人物模块 结束 ===================== */
+
 /* ---------- ⑤ 建人物（面片 + 脚下柔和阴影 + 隐形点选盒） ---------- */
 function vcharApplyGeom(o) {
     const box = VCHAR_CACHE[o.userData.vcharId];
@@ -1470,6 +1783,7 @@ function updateVideoChars(t) {
     if (!_vcLightEl) _vcLightEl = document.getElementById('light-intensity');
     const br = _vcLightEl ? Math.max(0.40, Math.min(1.55, parseFloat(_vcLightEl.value) || 1)) : 1;
     const need = {};
+    const wantState = {};   /* ★ 多片段人物：此刻该显示哪个状态片段 */
     for (let i = VCHAR_LIST.length - 1; i >= 0; i--) {
         const o = VCHAR_LIST[i];
         if (!o.parent) { VCHAR_LIST.splice(i, 1); continue; }
@@ -1477,11 +1791,21 @@ function updateVideoChars(t) {
         const m = o.userData.vcMesh;
         if (m && m.material && m.material.uniforms) m.material.uniforms.uBright.value = br;
         const id = o.userData.vcharId;
-        let rate = VCHAR_TUNE.idleRate || 0;
         let talking = false;
         try { talking = (chatTarget === o) && (ttsSpeaking || TALK.on); } catch (e) {}
         /* ★ 只有"声音真的在响"才算正在说话：合成/缓冲的空档定格不动嘴 */
         if (talking) { try { if (!vcharVoiceLive()) talking = false; } catch (e) {} }
+        const box0 = VCHAR_CACHE[id];
+        if (box0 && box0.multi) {
+            /* 多片段：说话>跳舞>哭/笑>不说话，自动挑对应视频 */
+            let st = 'idle';
+            if (talking) st = 'talk';
+            else if (o.userData._vcDance) st = 'dance';
+            else if (o.userData._vcAction) st = o.userData._vcAction;
+            wantState[id] = vcMergeState(wantState[id], st);
+            continue;
+        }
+        let rate = VCHAR_TUNE.idleRate || 0;
         if (talking) {
             let lv = 0;
             try { lv = (SFV && SFV.level) ? SFV.level : 0; } catch (e) {}
@@ -1492,7 +1816,7 @@ function updateVideoChars(t) {
     }
     for (const k in need) {
         const box = VCHAR_CACHE[k];
-        if (!box || !box.ready || !box.video) continue;
+        if (!box || !box.ready || !box.video || box.multi) continue;
         const v = box.video;
         let want = need[k];
         /* ★ 刚载入的 1.8 秒先正常播一下：让「透明通道探测 / 幕布自动取色」拿到有效画面，
@@ -1522,6 +1846,10 @@ function updateVideoChars(t) {
                 try { box.drawCtx.drawImage(v, 0, 0, box.drawCv.width, box.drawCv.height); box.tex.needsUpdate = true; } catch (e) {}
             }
         }
+    }
+    for (const k in wantState) {
+        const box = VCHAR_CACHE[k];
+        if (box && box.ready && box.multi) updateMultiClip(box, wantState[k]);
     }
 }
 /* 借用已有的每帧遍历当驱动，loop() 一行都不用改 */
@@ -5673,6 +6001,65 @@ function placeScatterOne(group, rec, baseY) {
         registerSway(m, isTreeId(rec.id));
     }
 }
+function scatterPathClosed(pts) {
+    if (!pts || pts.length < 3) return false;
+    const a = pts[0], b = pts[pts.length - 1];
+    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+    for (let i = 0; i < pts.length; i++) {
+        const p = pts[i];
+        minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
+        minZ = Math.min(minZ, p.z); maxZ = Math.max(maxZ, p.z);
+    }
+    const span = Math.max(maxX - minX, maxZ - minZ);
+    // 首尾靠得够近(相对整体尺寸)才算闭合区域，否则视为一条开放线
+    return Math.hypot(a.x - b.x, a.z - b.z) < Math.max(0.35, span * 0.30);
+}
+function buildScatterLine(linePts, baseY, tag) {
+    if (scatterSel.size === 0) { showSysToast('请先在"组合"面板里勾选植物'); return; }
+    if (!linePts || linePts.length < 2) { showSysToast('路径无效'); return; }
+    const spacing = (parseFloat(document.getElementById('scatter-density').value) || 600) / 1000;
+    const sizeMul = parseFloat(document.getElementById('scatter-size').value) || 1;
+    const ids = Array.from(scatterSel);
+    let totalLen = 0; const segs = [];
+    for (let i = 0; i < linePts.length - 1; i++) {
+        const p1 = linePts[i], p2 = linePts[i + 1];
+        const len = Math.hypot(p2.x - p1.x, p2.z - p1.z);
+        segs.push({ p1, p2, len }); totalLen += len;
+    }
+    if (totalLen < 0.05) { showSysToast('路径太短'); return; }
+    const group = new THREE.Group();
+    group.userData.isModel = true;
+    group.userData.isScatter = true;
+    group.userData.id = 'scatter_group';
+    group.userData.scatterItems = [];
+    group.userData.scatterBaseY = baseY;
+    group.userData.scatterLine = linePts.map(p => ({ x: p.x, z: p.z }));   // ★ 线形标记
+    group.userData.scatterIds = ids.slice();
+    group.userData.scatterSpacing = spacing;
+    group.userData.scatterSize = sizeMul;
+    scene.add(group);
+    placedObjects.push(group);
+    const step = Math.max(0.06, spacing);
+    let count = 0;
+    for (let d = 0; d <= totalLen + 1e-6; d += step) {
+        let accum = 0, seg = segs[0], t = 0;
+        for (let s of segs) { if (accum + s.len >= d) { seg = s; t = s.len > 0 ? (d - accum) / s.len : 0; break; } accum += s.len; }
+        const rec = {
+            id: ids[Math.floor(Math.random() * ids.length)],
+            x: seg.p1.x + (seg.p2.x - seg.p1.x) * t,
+            z: seg.p1.z + (seg.p2.z - seg.p1.z) * t,
+            ry: Math.random() * Math.PI * 2,
+            sc: sizeMul * (0.8 + Math.random() * 0.4),
+            rx: (Math.random() - 0.5) * 0.06,
+            rz: (Math.random() - 0.5) * 0.06
+        };
+        group.userData.scatterItems.push(rec);
+        placeScatterOne(group, rec, baseY);
+        count++;
+    }
+    showSysToast(`🌿 已沿${tag}成排生成 ${count} 株`);
+    selectObject(group);
+}
 function buildScatter(poly, baseY, tag, margin) {
     if (scatterSel.size === 0) { showSysToast('请先在"组合"面板里勾选植物'); return; }
     if (margin == null) margin = 0.06;
@@ -5717,8 +6104,9 @@ function buildScatter(poly, baseY, tag, margin) {
 }
 function rebuildScatter(group) {
     if (!group || !group.userData.isScatter) return;
+    const isLine = !!(group.userData.scatterLine && group.userData.scatterLine.length >= 2);
     const poly = group.userData.scatterPoly;
-    if (!poly || poly.length < 3) { showSysToast('该组合无区域信息，无法调整'); return; }
+    if (!isLine && (!poly || poly.length < 3)) { showSysToast('该组合无区域信息，无法调整'); return; }
     const spacing = (parseFloat(document.getElementById('scatter-density').value) || 600) / 1000;
     const sizeMul = parseFloat(document.getElementById('scatter-size').value) || 1;
     const ids = (group.userData.scatterIds && group.userData.scatterIds.length) ? group.userData.scatterIds : Array.from(scatterSel);
@@ -5726,11 +6114,29 @@ function rebuildScatter(group) {
     const baseY = (group.userData.scatterBaseY != null) ? group.userData.scatterBaseY : (groundLevel + 0.01);
     pruneSway(group);
     for (let i = group.children.length - 1; i >= 0; i--) group.remove(group.children[i]);
-    const mg = (group.userData.scatterMargin != null) ? group.userData.scatterMargin : 0.06;
-    const spots = samplePointsInPoly(poly, spacing, 400, mg);
     group.userData.scatterItems = [];
     group.userData.scatterSpacing = spacing;
     group.userData.scatterSize = sizeMul;
+    let spots;
+    if (isLine) {
+        // ★ 线形组合：沿路径按新间距重新成排排布
+        const lp = group.userData.scatterLine;
+        let totalLen = 0; const segs = [];
+        for (let i = 0; i < lp.length - 1; i++) {
+            const len = Math.hypot(lp[i + 1].x - lp[i].x, lp[i + 1].z - lp[i].z);
+            segs.push({ p1: lp[i], p2: lp[i + 1], len }); totalLen += len;
+        }
+        const step = Math.max(0.06, spacing);
+        spots = [];
+        for (let d = 0; d <= totalLen + 1e-6; d += step) {
+            let accum = 0, seg = segs[0], t = 0;
+            for (let s of segs) { if (accum + s.len >= d) { seg = s; t = s.len > 0 ? (d - accum) / s.len : 0; break; } accum += s.len; }
+            spots.push({ x: seg.p1.x + (seg.p2.x - seg.p1.x) * t, z: seg.p1.z + (seg.p2.z - seg.p1.z) * t });
+        }
+    } else {
+        const mg = (group.userData.scatterMargin != null) ? group.userData.scatterMargin : 0.06;
+        spots = samplePointsInPoly(poly, spacing, 400, mg);
+    }
     spots.forEach(sp => {
         const rec = {
             id: ids[Math.floor(Math.random() * ids.length)],
@@ -5809,11 +6215,19 @@ function setupInteractions() {
     };
     document.getElementById('btn-scatter-area').onclick = (e) => {
         e.stopPropagation();
-        if (pathPoints.length < 3) { showSysToast('请先按住画线圈出一个区域'); return; }
-        const cp = cleanClosedPathPoints(pathPoints);
-        if (cp.length < 3) { showSysToast('区域点太少'); return; }
-        const sm = getSmoothPath(cp, true);
-        buildScatter(sm.map(p => ({ x: p.x, z: p.z })), groundLevel + 0.01, '所画区域', 0.06);
+        if (pathPoints.length < 2) { showSysToast('请先按住画线：不闭合=沿线排布，闭合=区域内散布'); return; }
+        /* ★ 2026 新增：判断这条线是否闭合。
+           不闭合 → 沿路径成排放置（适合花池/花境单行）；闭合 → 在闭合区域内散布 */
+        if (scatterPathClosed(pathPoints)) {
+            const cp = cleanClosedPathPoints(pathPoints);
+            if (cp.length < 3) { showSysToast('区域点太少'); return; }
+            const sm = getSmoothPath(cp, true);
+            buildScatter(sm.map(p => ({ x: p.x, z: p.z })), groundLevel + 0.01, '所画区域', 0.06);
+        } else {
+            const sm = getSmoothPath(pathPoints, false);
+            if (!sm || sm.length < 2) { showSysToast('路径点太少'); return; }
+            buildScatterLine(sm.map(p => ({ x: p.x, z: p.z })), groundLevel + 0.01, '所画路径');
+        }
         if (currentLine) { fadingLines.push(currentLine); currentLine = null; }
         pathPoints = []; updatePreviewLine();
     };
@@ -6026,6 +6440,19 @@ function setupInteractions() {
         }
         try { vcRenderRows(); } catch (e2) {}
     };
+
+    const scBtn = document.getElementById('sc-toggle');
+    if (scBtn) {
+        ['pointerdown','pointerup','pointermove','touchstart','touchmove','touchend','mousedown','mousemove','mouseup','click']
+            .forEach(t => scBtn.addEventListener(t, ev => ev.stopPropagation()));
+        scBtn.onclick = (e) => {
+            e.stopPropagation();
+            const hid = document.body.classList.toggle('sc-hidden');
+            scBtn.classList.toggle('off', hid);
+            scBtn.title = hid ? '点此展开右侧调整键' : '收起右侧调整键';
+            showSysToast(hid ? '已收起右侧调整键，需要时点右侧🎚展开' : '已展开右侧调整键');
+        };
+    }
 
     const handleInteractStart = (clientX, clientY, touchesLength) => {
         hitExistingObject = false;
@@ -7548,6 +7975,7 @@ function serializeScene() {
             rec.scatterItems = ud.scatterItems || [];
             rec.baseY = (ud.scatterBaseY != null ? ud.scatterBaseY : groundLevel) - groundLevel;
             rec.scatterPoly = ud.scatterPoly || null;
+            rec.scatterLine = ud.scatterLine || null;
             rec.scatterIds = ud.scatterIds || [];
             rec.spacing = (ud.scatterSpacing != null ? ud.scatterSpacing : 0.6);
             rec.size = (ud.scatterSize != null ? ud.scatterSize : 1);
@@ -7623,6 +8051,7 @@ function rebuildOne(rec) {
         g.userData.isModel = true; g.userData.isScatter = true; g.userData.id = 'scatter_group';
         g.userData.scatterItems = rec.scatterItems || [];
         g.userData.scatterPoly = rec.scatterPoly || null;
+        g.userData.scatterLine = rec.scatterLine || null;
         g.userData.scatterIds = rec.scatterIds || [];
         g.userData.scatterSpacing = (rec.spacing != null ? rec.spacing : 0.6);
         g.userData.scatterSize = (rec.size != null ? rec.size : 1);
@@ -8922,9 +9351,9 @@ function _ttsIdle() {
 
 /* 云端播放循环：一路预取+解码，排到 Web Audio 时间轴上首尾相接播放 → 不再断断续续 */
 async function _ttsPumpCloud(my) {
-    const jobs = [];                                 // 预取并行解码
+    const jobs = [];                                 // 预取并行解码（★2026 多预取一句，语音更连贯不卡顿）
     const fill = () => {
-        while (jobs.length < 3 && ttsQ.length > 0) {
+        while (jobs.length < 4 && ttsQ.length > 0) {
             const s = ttsQ.shift();
             jobs.push({ seg: s, p: sfTTS(s, SF_EMO_NOW).catch(() => null) });
         }
@@ -8955,7 +9384,7 @@ async function _ttsPumpCloud(my) {
             return;
         }
         sfScheduleBuffer(buf, my);                    // 无缝接到时间轴
-        await sfWaitLead(my, 0.55);                   // 保持约 0.55 秒余量，既不断也不占内存
+        await sfWaitLead(my, 0.70);                   // ★保持约 0.70 秒余量：网络稍差也不断句、更流畅
     }
 }
 /* 本地兜底播放（原逻辑） */
@@ -10941,7 +11370,9 @@ function openChatPanel(obj) {          // 轻点任意一位人物 → 直接切
     if (VC.set.share && !VIS.on) visStart();
 
     if (!same) {
-          if (!obj.userData._greeted) {                                        // ★每位人物各自问候一次
+        const _mcId = obj.userData.id || obj.userData.modelId;
+        const _isMC = !!(VCHAR_CACHE[_mcId] && VCHAR_CACHE[_mcId].multi);
+        if (!obj.userData._greeted && !_isMC) {                                 // ★每位人物各自问候一次（多片段人物不自动说话）
             obj.userData._greeted = 1;
             const g = greetLine(characterName(obj));
             obj.userData._chatLog.push({ role: 'assistant', content: g });
@@ -10962,6 +11393,7 @@ function closeChatPanel() {
     const c = document.getElementById('vc-set'); if (c) c.classList.remove('on');
     const r = document.getElementById('vc-row'); if (r) r.style.display = 'none';
     talkResetRig(TALK.rig);
+    if (chatTarget && chatTarget.userData) { chatTarget.userData._vcDance = false; chatTarget.userData._vcAction = ''; }
     chatTarget = null; TALK.rig = null;
     showSysToast('📞 已挂断语音通话');
 }
@@ -10970,6 +11402,8 @@ async function sendChat(text, hidden) {
     if (!chatTarget) return;
     /* ★ 古筝女：弹奏 / 停止 / 报曲目 等指令本地处理，不走 AI */
     try { if (await handleGuzhengCommand(text)) return; } catch (e) {}
+    /* ★ 多片段人物：跳舞 / 停 / 哭 / 笑 指令本地处理，不走 AI */
+    try { if (await handleActionCommand(text)) return; } catch (e) {}
     const obj = chatTarget;
     const my = ++chatToken;
     /* ★ 新问题 = 立刻打断：掐掉上一条请求 + 停止朗读，不再提示"上一句还在回答" */
